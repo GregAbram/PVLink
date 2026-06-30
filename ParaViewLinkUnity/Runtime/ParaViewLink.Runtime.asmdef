@@ -1,0 +1,14 @@
+{
+    "name": "ParaViewLink.Runtime",
+    "rootNamespace": "ParaViewLink",
+    "references": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

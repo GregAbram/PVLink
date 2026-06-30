@@ -1,0 +1,30 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "ParaView Link",
+    "Description": "Streams mesh geometry and scalar field data from ParaView into Unreal Engine 5 over TCP. Provides a GameInstanceSubsystem, a procedural mesh actor, and a sim-container placement actor for mapping computational coordinates to UE world space.",
+    "Category": "Visualization",
+    "CreatedBy": "",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "SupportURL": "",
+    "CanContainContent": true,
+    "IsBetaVersion": true,
+    "IsExperimentalVersion": false,
+    "EnabledByDefault": true,
+    "Modules": [
+        {
+            "Name": "ParaViewLink",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "ProceduralMeshComponent",
+            "Enabled": true
+        }
+    ]
+}

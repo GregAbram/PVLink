@@ -1,0 +1,11 @@
+{
+  "name": "com.paraviewlink.unity",
+  "version": "0.1.0",
+  "displayName": "ParaViewLink",
+  "description": "Real-time mesh streaming from ParaView to Unity via TCP. Receives geometry, per-vertex scalars, and colormaps sent by the UE5MeshSender ParaView plugin.",
+  "unity": "2021.3",
+  "author": {
+    "name": "ParaViewLink"
+  },
+  "dependencies": {}
+}
