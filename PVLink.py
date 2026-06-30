@@ -252,6 +252,7 @@ class _ColormapWatcher:
         self._conn          = conn
         self._observed      = {}   # var_name -> (lut_proxy, observer_tag)
         self._last_payloads = {}   # var_name -> last built payload (for reconnect replay)
+        self._last_rgb_pts  = {}   # var_name -> tuple of RGBPoints at last send
         self._host          = "127.0.0.1"
         self._port          = 9001
 
@@ -263,7 +264,8 @@ class _ColormapWatcher:
         """Watch *var_name*.
         Always sends the current colormap immediately so Unity has it before
         the accompanying mesh arrives, even if already watching.
-        The ModifiedEvent observer handles subsequent changes.
+        Re-registers the ModifiedEvent observer each call in case ParaView
+        replaced the LUT proxy (happens when switching colormap presets).
         """
         if not var_name:
             return
@@ -277,8 +279,19 @@ class _ColormapWatcher:
             # even after a reconnect or pipeline re-execute.
             self._send(var_name, lut)
 
-            if var_name in self._observed:
-                return                  # observer already registered
+            # If we already have an observer, check whether the LUT proxy is
+            # still the same object.  ParaView replaces the proxy when the user
+            # applies a new colormap preset, so we must re-register in that case.
+            existing = self._observed.get(var_name)
+            if existing is not None:
+                old_lut, old_tag = existing
+                if old_lut.SMProxy.GetGlobalIDAsString() == lut.SMProxy.GetGlobalIDAsString():
+                    return              # same proxy, observer still valid
+                # Proxy was replaced — remove the stale observer.
+                try:
+                    old_lut.SMProxy.RemoveObserver(old_tag)
+                except Exception:
+                    pass
 
             def _on_modified(obj, event, vn=var_name):
                 try:
@@ -328,6 +341,11 @@ class _ColormapWatcher:
         except Exception as exc:
             print(f"PVLink:colormap payload error for '{var_name}': {exc}")
             return
+        # Snapshot RGBPoints so the render observer can detect future changes.
+        try:
+            self._last_rgb_pts[var_name] = tuple(lut.RGBPoints) if lut.RGBPoints else ()
+        except Exception:
+            pass
         # Store so the manager can replay this on reconnect.
         self._last_payloads[var_name] = payload
         if self._conn.ensure_connected(self._host, self._port):
@@ -357,7 +375,7 @@ class _UpdateTrigger:
         self._host    = host
         self._port    = port
         self._pending = True
-        self._ensure_observer()
+        self._ensure_observer(force=False)
 
     def reset(self):
         if self._tag is not None and self._view_proxy is not None:
@@ -369,12 +387,21 @@ class _UpdateTrigger:
         self._view_proxy = None
         self._pending    = False
 
-    def _ensure_observer(self):
-        if self._tag is not None:
-            return
+    def _ensure_observer(self, force=False):
         try:
             import paraview.simple as pvs
             view = pvs.GetActiveViewOrCreate('RenderView')
+            # Re-register if forced, or if the view proxy changed, or if never registered.
+            current_proxy = view.SMProxy
+            if not force and self._tag is not None and self._view_proxy is current_proxy:
+                return
+            # Remove stale observer if any.
+            if self._tag is not None and self._view_proxy is not None:
+                try:
+                    self._view_proxy.RemoveObserver(self._tag)
+                except Exception:
+                    pass
+                self._tag = None
 
             def _on_end_render(obj, event):
                 print("On End Render")
@@ -510,7 +537,7 @@ def get_pvlink_manager():
     global _fallback_manager
     try:
         import paraview.servermanager as sm
-        if not hasattr(sm, '_pvlink_manager'):
+        if not hasattr(sm, '_pvlink_manager') or not isinstance(sm._pvlink_manager, PVLinkConnectionManager):
             sm._pvlink_manager = PVLinkConnectionManager()
         return sm._pvlink_manager
     except ImportError:
