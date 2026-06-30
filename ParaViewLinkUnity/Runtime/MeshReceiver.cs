@@ -104,6 +104,7 @@ namespace ParaViewLink
         {
             public MeshInstance Front;  // active / visible
             public MeshInstance Back;   // inactive / being prepared
+            public string VariableName; // colormap variable currently applied to Front
 
             /// <summary>Promote back to front.  Both SetActive calls happen here.</summary>
             public void Swap()
@@ -204,6 +205,8 @@ namespace ParaViewLink
         // -----------------------------------------------------------------
         private void Awake()
         {
+            Application.runInBackground = true;
+
             var mr = GetComponent<MeshRenderer>();
             if (mr != null)
             {
@@ -220,6 +223,11 @@ namespace ParaViewLink
                 if (_meshPairs.TryGetValue(v.MeshName, out MeshBufferPair p))
                     p.Front.Renderer.enabled = v.Visible;
             }
+
+            // Colormap updates are applied every frame so live preset changes
+            // in ParaView are reflected immediately without waiting for a mesh resend.
+            while (_colormapQueue.TryDequeue(out RawColormap cm))
+                ApplyColormap(cm);
 
             // Non-blocking flip check.
             if (_flipSignal.Wait(0))
@@ -247,6 +255,7 @@ namespace ParaViewLink
                     break;
 
                 case MeshCmd.PVMesh:
+                {
                     // Parse and process all mesh data on the IO thread
                     // (normals, scalar colours, winding flip, AABB) into plain
                     // managed arrays.  No Unity Mesh API is called here.
@@ -257,10 +266,15 @@ namespace ParaViewLink
                               $"bounds={parsed.MeshBounds}  var='{parsed.VariableName}'");
                     _meshQueue.Enqueue(parsed);
                     break;
+                }
 
                 case MeshCmd.Colormap:
-                    _colormapQueue.Enqueue(ParseColormap(payload));
+                {
+                    var cm = ParseColormap(payload);
+                    Debug.Log($"[ParaViewLink] Colormap received: var='{cm.VariableName}' samples={cm.Samples.Length}");
+                    _colormapQueue.Enqueue(cm);
                     break;
+                }
 
                 case MeshCmd.Bounds:
                     lock (_boundsLock)
@@ -376,11 +390,10 @@ namespace ParaViewLink
             // ── Normals ───────────────────────────────────────────────────
             if (pvNormals != null)
             {
-                // PV normals negated: winding flip reverses face orientation.
                 for (int i = 0; i < numVerts; i++)
                 {
                     var v = verts[i];
-                    v.NX = -pvNormals[i].x; v.NY = -pvNormals[i].y; v.NZ = -pvNormals[i].z;
+                    v.NX = pvNormals[i].x; v.NY = pvNormals[i].y; v.NZ = pvNormals[i].z;
                     verts[i] = v;
                 }
             }
@@ -471,7 +484,9 @@ namespace ParaViewLink
                 ComputeCoordTransform();
             }
 
-            // 2. Apply colormaps before meshes so materials are ready.
+            // 2. Flush any colormaps that arrived just before this flip
+            //    (Update() drains the queue each frame; this catches the rare
+            //    case where a colormap and mesh arrive in the same network burst).
             while (_colormapQueue.TryDequeue(out RawColormap cm))
                 ApplyColormap(cm);
 
@@ -537,7 +552,10 @@ namespace ParaViewLink
             mesh.bounds = pm.MeshBounds;
 
             if (!string.IsNullOrEmpty(pm.VariableName))
+            {
                 pair.Back.Renderer.sharedMaterial = EnsureVarMaterial(pm.VariableName);
+                pair.VariableName = pm.VariableName;
+            }
 
             pair.Back.Go.transform.SetPositionAndRotation(_coordPos, _coordRot);
             pair.Back.Go.transform.localScale = _coordScale;
@@ -567,7 +585,7 @@ namespace ParaViewLink
             return pair;
         }
 
-        private static MeshInstance MakeInstance(string name)
+        private MeshInstance MakeInstance(string name)
         {
             var go       = new GameObject(name);
             go.transform.SetParent(_bufferParent?.transform, false);
@@ -583,33 +601,42 @@ namespace ParaViewLink
 
         private void ApplyColormap(RawColormap cm)
         {
+            // Always create a new Texture2D so Unity sees a genuinely new object
+            // on the material and flushes any cached GPU state.
+            if (_colormaps.TryGetValue(cm.VariableName, out Texture2D old) && old != null)
+                Destroy(old);
+
             int w = cm.Samples.Length;
-            if (!_colormaps.TryGetValue(cm.VariableName, out Texture2D tex)
-                || tex == null || tex.width != w)
+            var tex = new Texture2D(w, 1, TextureFormat.RGBA32, false)
             {
-                tex = new Texture2D(w, 1, TextureFormat.RGBA32, false)
-                {
-                    name       = $"PVColormap_{cm.VariableName}",
-                    wrapMode   = TextureWrapMode.Clamp,
-                    filterMode = FilterMode.Bilinear,
-                };
-                _colormaps[cm.VariableName] = tex;
-            }
-        // Apply the colormap texture and attach it to the material.  The
-        // base material may not be assigned in some editor builds, so guard
-        // against a null return from EnsureVarMaterial.
-        tex.SetPixels(cm.Samples);
-        tex.Apply();
+                name       = $"PVColormap_{cm.VariableName}",
+                wrapMode   = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Bilinear,
+            };
+            tex.SetPixels(cm.Samples);
+            tex.Apply();
+            _colormaps[cm.VariableName] = tex;
         var mat = EnsureVarMaterial(cm.VariableName);
         if (mat != null)
         {
             mat.SetTexture("_Colormap", tex);
+            // Re-assign the material on any live renderers using this variable
+            // so the updated texture is immediately visible without waiting for
+            // the next mesh packet.
+            foreach (var pair in _meshPairs.Values)
+            {
+                if (pair.VariableName == cm.VariableName)
+                {
+                    pair.Front.Renderer.sharedMaterial = mat;
+                    Debug.Log($"[ParaViewLink] Applied colormap '{cm.VariableName}' to renderer '{pair.Front.Go.name}'");
+                }
+            }
         }
         else
         {
             Debug.LogWarning("[ParaViewLink] BaseScalarMaterial not set – cannot apply colormap for '" + cm.VariableName + "'.");
         }
-            Debug.Log($"[ParaViewLink] Colormap '{cm.VariableName}' [{cm.Min:G4}, {cm.Max:G4}]");
+        Debug.Log($"[ParaViewLink] Colormap '{cm.VariableName}' [{cm.Min:G4}, {cm.Max:G4}]");
         }
 
         private Material EnsureVarMaterial(string varName)
