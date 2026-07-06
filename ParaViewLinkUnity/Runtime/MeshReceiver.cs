@@ -17,15 +17,11 @@ namespace ParaViewLink
     /// ───────────────
     /// IO thread (SocketReceiver.OnMessage):
     ///   • Parses every message.
-    ///   • For PVMesh: calls Mesh.AllocateWritableMeshData, fills all vertex/index/
-    ///     colour/normal data into native buffers, computes the AABB — entirely
-    ///     off the main thread — then enqueues the ready MeshDataArray.
-    ///     Returns immediately → ack sent to ParaView.
+    ///   • For PVMesh: builds vertex/index/normal/colour buffers off the main
+    ///     thread, enqueues the result, returns immediately.
     ///   • For Colormap/Bounds/Visibility: parses into plain structs and enqueues.
-    ///     Returns immediately → ack sent.
     ///   • For Update (flip): releases _flipSignal then BLOCKS on _flipDone until
-    ///     the main thread confirms the swap.  The ack to ParaView is intentionally
-    ///     withheld until the new frame is live.
+    ///     the main thread confirms the swap.  No ack is sent (one-way protocol).
     ///
     /// Main thread (Update):
     ///   • Applies immediate visibility changes from the visibility queue.
@@ -33,7 +29,7 @@ namespace ParaViewLink
     ///       1. Applies pending bounds/colormaps.
     ///       2. For each queued ParsedMesh: calls ApplyAndDisposeWritableMeshData
     ///          (fast GPU upload of the pre-built buffers) then swaps front/back.
-    ///       3. Releases _flipDone → IO thread wakes and acks ParaView.
+    ///       3. Releases _flipDone → IO thread unblocks.
     ///
     /// Per-mesh double buffer
     /// ──────────────────────
@@ -227,13 +223,17 @@ namespace ParaViewLink
             // Colormap updates are applied every frame so live preset changes
             // in ParaView are reflected immediately without waiting for a mesh resend.
             while (_colormapQueue.TryDequeue(out RawColormap cm))
+            {
+                Debug.Log($"[ParaViewLink] Update(): applying colormap '{cm.VariableName}' from queue");
                 ApplyColormap(cm);
+            }
 
             // Non-blocking flip check.
             if (_flipSignal.Wait(0))
             {
-                SwapBuffers();
-                _flipDone.Release();  // IO thread wakes → sends ack to ParaView
+                try   { SwapBuffers(); }
+                catch (Exception ex) { Debug.LogError($"[ParaViewLink] SwapBuffers exception: {ex}"); }
+                finally { _flipDone.Release(); }  // IO thread wakes → sends ack to ParaView
             }
         }
 
@@ -277,22 +277,30 @@ namespace ParaViewLink
                 }
 
                 case MeshCmd.Bounds:
+                {
+                    var b = ParseBounds(payload);
+                    Debug.Log($"[ParaViewLink] Bounds received: {b}");
                     lock (_boundsLock)
                     {
-                        _incomingBounds   = ParseBounds(payload);
+                        _incomingBounds   = b;
                         _hasPendingBounds = true;
                     }
                     break;
+                }
 
                 case MeshCmd.Visibility:
-                    _visibilityQueue.Enqueue(ParseVisibility(payload));
+                {
+                    var v = ParseVisibility(payload);
+                    Debug.Log($"[ParaViewLink] Visibility received: '{v.MeshName}' → {v.Visible}");
+                    _visibilityQueue.Enqueue(v);
                     break;
+                }
 
                 case MeshCmd.Update:
-                    // Signal the main thread then block until it confirms the swap.
-                    // ParaView's ack is withheld until the new frame is live.
+                    Debug.Log($"[ParaViewLink] Update received — signalling main thread flip");
                     _flipSignal.Release();
                     _flipDone.Wait();
+                    Debug.Log($"[ParaViewLink] Update: flip complete, ack sent to ParaView");
                     break;
             }
         }
@@ -553,8 +561,16 @@ namespace ParaViewLink
 
             if (!string.IsNullOrEmpty(pm.VariableName))
             {
-                pair.Back.Renderer.sharedMaterial = EnsureVarMaterial(pm.VariableName);
+                var mat = EnsureVarMaterial(pm.VariableName);
+                pair.Back.Renderer.sharedMaterial = mat;
                 pair.VariableName = pm.VariableName;
+                Debug.Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': set back-buffer material for var='{pm.VariableName}'" +
+                          $"  mat={mat?.name ?? "NULL"}" +
+                          $"  colormap tex={(mat != null ? mat.GetTexture("_Colormap")?.name ?? "NULL" : "N/A")}");
+            }
+            else
+            {
+                Debug.Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': no VariableName — material unchanged");
             }
 
             pair.Back.Go.transform.SetPositionAndRotation(_coordPos, _coordRot);
@@ -623,14 +639,20 @@ namespace ParaViewLink
             // Re-assign the material on any live renderers using this variable
             // so the updated texture is immediately visible without waiting for
             // the next mesh packet.
+            bool anyUpdated = false;
             foreach (var pair in _meshPairs.Values)
             {
+                Debug.Log($"[ParaViewLink] ApplyColormap: checking pair '{pair.Front.Go.name}'" +
+                          $"  pair.VariableName='{pair.VariableName}'  looking for='{cm.VariableName}'");
                 if (pair.VariableName == cm.VariableName)
                 {
                     pair.Front.Renderer.sharedMaterial = mat;
-                    Debug.Log($"[ParaViewLink] Applied colormap '{cm.VariableName}' to renderer '{pair.Front.Go.name}'");
+                    anyUpdated = true;
+                    Debug.Log($"[ParaViewLink] ApplyColormap: reassigned material on '{pair.Front.Go.name}'");
                 }
             }
+            if (!anyUpdated)
+                Debug.Log($"[ParaViewLink] ApplyColormap '{cm.VariableName}': no live renderer matched (colormap cached, will apply at next mesh swap)");
         }
         else
         {
