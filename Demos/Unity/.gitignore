@@ -1,0 +1,10 @@
+# Unity generated — never commit
+Library/
+Logs/
+Temp/
+obj/
+Build/
+Builds/
+UserSettings/
+
+.DS_Store

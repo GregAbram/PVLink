@@ -1,6 +1,9 @@
 #pragma once
 #include "CoreMinimal.h"
 
+/** Wire protocol version implemented by this UE receiver. */
+constexpr int32 ProtocolVersion = 11;  // 1.1: normals field in PVMesh, UPDATE-only ack
+
 namespace MeshCmd {
     constexpr int32 String   = 0;
     constexpr int32 Mesh     = 1;

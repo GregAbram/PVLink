@@ -1,0 +1,13 @@
+# Unreal Engine generated — never commit
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Xcode / IDE
+*.xcworkspace
+*.code-workspace
+compile_commands.json
+
+.DS_Store

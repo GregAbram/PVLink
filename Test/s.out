@@ -1,5 +1,0 @@
-Connecting to 129.114.10.234:19001 ...
-Traceback (most recent call last):
-  File "/home/gda/MAC/test/tcp_sender.py", line 42, in <module>
-    s.connect((HOST, PORT))
-ConnectionRefusedError: [Errno 111] Connection refused

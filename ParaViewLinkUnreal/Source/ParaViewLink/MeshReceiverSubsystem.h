@@ -63,6 +63,13 @@ private:
     // work after the subsystem has been torn down.
     bool bActive = false;
 
+    // Manual-reset event used to synchronise the UPDATE ack with the game-thread
+    // buffer swap.  The IO thread (HandleRawMessage for CMD_UPDATE) waits on this
+    // event after enqueuing the Flip command; Tick() triggers it after the swap is
+    // complete, allowing HandleRawMessage to return and SocketReceiverRunnable::Run()
+    // to send the ack to ParaView.
+    FEvent* FlipEvent = nullptr;
+
     // --- install queue (network thread → game thread) ---
     TQueue<TUniquePtr<FPendingCommand>, EQueueMode::Spsc> InstallQueue;
 

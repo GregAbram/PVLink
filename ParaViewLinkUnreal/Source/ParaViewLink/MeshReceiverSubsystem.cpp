@@ -105,6 +105,9 @@ void UMeshReceiverSubsystem::Initialize(FSubsystemCollectionBase& Collection)
         UE_LOG(LogTemp, Warning, TEXT("MeshReceiverSubsystem: M_ScalarField not found — colormap display unavailable."));
     }
 
+    // Create the flip-sync event (auto-reset so each Wait() consumes one Trigger()).
+    FlipEvent = FPlatformProcess::GetSynchEventFromPool(/*bIsManualReset=*/false);
+
     UE_LOG(LogTemp, Warning, TEXT("MeshReceiverSubsystem: Ready"));
     bActive = true;
 }
@@ -114,11 +117,23 @@ void UMeshReceiverSubsystem::Deinitialize()
     // Stop ticking immediately so no game-thread Tick() fires after this point.
     bActive = false;
 
+    // If the IO thread is blocked in HandleRawMessage waiting for the flip event,
+    // unblock it so the thread can exit cleanly when Super calls Stop() + WaitForCompletion().
+    if (FlipEvent)
+        FlipEvent->Trigger();
+
     // Stop the network thread and wait for it to exit BEFORE touching any state.
     // Super::Deinitialize() clears OnMessageReceived, calls Stop(), then
     // WaitForCompletion() — so when it returns the receiver thread is fully gone
     // and HandleRawMessage() can never be called again.
     Super::Deinitialize();
+
+    // Return the event to the pool now that the IO thread is guaranteed gone.
+    if (FlipEvent)
+    {
+        FPlatformProcess::ReturnSynchEventToPool(FlipEvent);
+        FlipEvent = nullptr;
+    }
 
     // Now it is safe to drain and clear. The thread is dead, the callback is
     // null — nothing can enqueue new commands or hold references to our UObjects.
@@ -154,6 +169,15 @@ void UMeshReceiverSubsystem::HandleRawMessage(int32 Cmd, TArray<uint8> Payload)
     else if (Cmd == MeshCmd::Update)
     {
         PendCmd->Type = EPendingCmdType::Flip;
+        InstallQueue.Enqueue(MoveTemp(PendCmd));
+
+        // Block the IO thread here until Tick() completes the buffer swap and
+        // triggers FlipEvent.  SocketReceiverRunnable::Run() sends the ack to
+        // ParaView only after this function returns, so this ensures the ack is
+        // not sent until the flip is fully done.
+        if (FlipEvent)
+            FlipEvent->Wait();
+        return;
     }
     else if (Cmd == MeshCmd::Scalars)
     {
@@ -314,6 +338,11 @@ void UMeshReceiverSubsystem::Tick(float DeltaTime)
             }
             PendingMeshes.Empty();
             PendingPVData.Empty();
+
+            // Unblock the IO thread so SocketReceiverRunnable can send the
+            // UPDATE ack to ParaView.
+            if (FlipEvent)
+                FlipEvent->Trigger();
             break;
         }
         case EPendingCmdType::Scalars:
@@ -503,6 +532,7 @@ UTexture2D* UMeshReceiverSubsystem::CreateOrUpdateColormapTexture(
         Tex->SRGB = 0;
         Tex->CompressionSettings = TC_VectorDisplacementmap;
         Tex->Filter = TF_Bilinear;
+        Tex->AddressX = TA_Clamp;   // prevent u=1.0 wrapping to the first texel
     }
 
     // Write RGBA8 data
@@ -702,13 +732,15 @@ bool UMeshReceiverSubsystem::ParsePVMeshPayload(const TArray<uint8>& Payload,
                                                  FString&         OutColorName,
                                                  int32&           OutScalarLocation)
 {
-    // Wire layout (all little-endian, produced by UE5MeshSender.py):
+    // Wire layout (all little-endian, produced by UE5MeshSender.py — protocol v1.1):
     //   int32   num_points
     //   int32   num_triangles
     //   int32   scalar_location   (-1=none, 0=per-point, 1=per-cell)
+    //   int32   has_normals       (0=none, 1=per-point normals follow positions)
     //   int32   color_name_len
     //   int32   mesh_name_len
     //   float32[num_points * 3]   positions
+    //   float32[num_points * 3]   normals   (only present if has_normals == 1)
     //   int32[num_triangles * 3]  triangle indices
     //   float32[num_scalars]      scalar values  (present iff scalar_location >= 0)
     //   float32[2]                [scalar_min, scalar_max]
@@ -740,10 +772,11 @@ bool UMeshReceiverSubsystem::ParsePVMeshPayload(const TArray<uint8>& Payload,
     };
 
     // --- header ---
-    int32 NumPoints, NumTris, ScalarLoc, ColorNameLen, MeshNameLen;
+    int32 NumPoints, NumTris, ScalarLoc, HasNormals, ColorNameLen, MeshNameLen;
     if (!ReadInt32(NumPoints)     || NumPoints  < 0) return false;
     if (!ReadInt32(NumTris)       || NumTris    < 0) return false;
     if (!ReadInt32(ScalarLoc))                       return false;
+    if (!ReadInt32(HasNormals))                      return false;
     if (!ReadInt32(ColorNameLen)  || ColorNameLen < 0) return false;
     if (!ReadInt32(MeshNameLen)   || MeshNameLen  < 0) return false;
 
@@ -756,6 +789,20 @@ bool UMeshReceiverSubsystem::ParsePVMeshPayload(const TArray<uint8>& Payload,
         float Y = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
         float Z = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
         OutMesh.Vertices[i] = FVector(X, Y, Z);
+    }
+
+    // --- normals (optional, per-point) ---
+    if (HasNormals == 1)
+    {
+        if (Ptr + NumPoints * 12 > End) return false;
+        OutMesh.Normals.SetNumUninitialized(NumPoints);
+        for (int32 i = 0; i < NumPoints; ++i)
+        {
+            float X = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
+            float Y = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
+            float Z = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
+            OutMesh.Normals[i] = FVector(X, Y, Z);
+        }
     }
 
     // --- triangle indices ---

@@ -1,10 +1,39 @@
-# macOS
-.DS_Store
-
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.swp
 
-# OpenClaw runtime
+# Unity generated
+Demos/Unity/Library/
+Demos/Unity/Logs/
+Demos/Unity/Temp/
+Demos/Unity/obj/
+Demos/Unity/UserSettings/
+
+# Unreal generated
+Demos/Unreal/Binaries/
+Demos/Unreal/Build/
+Demos/Unreal/DerivedDataCache/
+Demos/Unreal/Intermediate/
+Demos/Unreal/Saved/
+Demos/Unreal/*.xcworkspace
+Demos/Unreal/*.code-workspace
+Demos/Unreal/compile_commands.json
+
+# Misc
+.DS_Store
+pvOut.txt
+ms.out
+*.out
+
+# Claude/agent working files
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
 .openclaw/
+*.pvsm
+*.vtp

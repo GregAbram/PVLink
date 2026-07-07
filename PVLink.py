@@ -55,7 +55,7 @@ Wire format (little-endian)
     (empty — 0 bytes)
 """
 
-PVLINK_VERSION = "1.17"
+PVLINK_VERSION = "1.19"
 
 import socket
 import struct
@@ -381,8 +381,9 @@ class PVLinkConnectionManager:
         self._watcher = _ColormapWatcher(self._sender)
         self._sender.start()
         self._meshes_pending      = False   # True when ≥1 mesh was sent this cycle
-        self._render_window       = None    # vtkRenderWindow being observed
-        self._render_observer_tag = None    # observer handle
+        self._update_timer        = None    # threading.Timer for debounced UPDATE
+        self._render_window       = None    # vtkRenderWindow being observed (kept for cleanup)
+        self._render_observer_tag = None    # observer handle (kept for cleanup)
 
     # --- address management --------------------------------------------------
 
@@ -432,10 +433,25 @@ class PVLinkConnectionManager:
 
     def mark_mesh_sent(self):
         """Signal that a mesh was sent this pipeline cycle.
-        The actual UPDATE is deferred until the render-window StartEvent fires,
-        which guarantees all MeshSenders in the pipeline have finished before
-        Unity is told to flip — keeping multi-mesh scenes in sync."""
+        Resets a 50 ms debounce timer; when it fires (after all MeshSenders
+        in the pipeline have run) a single UPDATE is sent to the receiver so
+        all meshes flip atomically."""
         self._meshes_pending = True
+        if self._update_timer is not None:
+            self._update_timer.cancel()
+        self._update_timer = threading.Timer(0.05, self._deferred_update)
+        self._update_timer.daemon = True
+        self._update_timer.start()
+
+    def _deferred_update(self):
+        """Called from the debounce timer thread — send UPDATE if still pending."""
+        if not self._meshes_pending:
+            return
+        self._meshes_pending = False
+        try:
+            self._sender.send_update()
+        except Exception as exc:
+            print(f"PVLink: deferred UPDATE failed — {exc}", flush=True)
 
     def register_render_observer(self, view):
         """Attach a one-time StartEvent observer to the render window so that
@@ -545,7 +561,7 @@ def get_pvlink_manager():
     global _fallback_manager
     try:
         import paraview.servermanager as sm
-        if not hasattr(sm, '_pvlink_manager') or not isinstance(sm._pvlink_manager, PVLinkConnectionManager):
+        if not hasattr(sm, '_pvlink_manager') or type(sm._pvlink_manager).__name__ != 'PVLinkConnectionManager':
             # Stop any stale sender thread from a previous manager before replacing it.
             old = getattr(sm, '_pvlink_manager', None)
             if old is not None and hasattr(old, '_sender'):

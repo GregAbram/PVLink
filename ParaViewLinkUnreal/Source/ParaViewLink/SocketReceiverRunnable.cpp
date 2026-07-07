@@ -1,4 +1,5 @@
 #include "SocketReceiverRunnable.h"
+#include "MeshTypes.h"
 #include "Sockets.h"
 #include "SocketSubsystem.h"
 
@@ -81,12 +82,15 @@ uint32 FSocketReceiverRunnable::Run()
                 break;
             }
 
-            // Ack before dispatching so Python can pipeline the next message
-            SendAck(ConnectionSocket, 0);
-
-            // Dispatch to owner (network thread — owner must not block here)
+            // For UPDATE: dispatch first (HandleRawMessage blocks until the game
+            // thread completes the buffer swap), then send the ack so ParaView
+            // knows the flip is done.  All other message types are fire-and-forget
+            // — no ack is sent and the IO thread does not block.
             if (OnMessageReceived)
                 OnMessageReceived(Type, MoveTemp(Payload));
+
+            if (Type == MeshCmd::Update)
+                SendAck(ConnectionSocket, 0);
         }
 
         ISocketSubsystem* SS = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
