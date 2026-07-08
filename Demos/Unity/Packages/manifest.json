@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.paraviewlink.unity": "file:/Users/gda/Documents/Claw/Projects/PVLink/ParaViewLinkUnity",
+    "com.paraviewlink.unity": "file:../../../ParaViewLinkUnity",
     "com.unity.ai.navigation": "2.0.10",
     "com.unity.collab-proxy": "2.11.3",
     "com.unity.ide.rider": "3.0.39",
