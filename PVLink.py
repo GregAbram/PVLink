@@ -53,9 +53,16 @@ Wire format (little-endian)
 
   Update payload (MSG_TYPE_UPDATE):
     (empty — 0 bytes)
+
+  Project payload (MSG_TYPE_PROJECT) — sent once, replayed on reconnect:
+    int32               name_len
+    utf8[name_len]      project name (identifies a DataManager cache directory)
+
+  Time payload (MSG_TYPE_TIME) — sent once per frame, from PVLinkDomainBoundsFilter:
+    float64              current pipeline time (UPDATE_TIME_STEP)
 """
 
-PVLINK_VERSION = "1.20"
+PVLINK_VERSION = "1.21"
 
 import socket
 import struct
@@ -77,6 +84,8 @@ MSG_TYPE_COLORMAP   =  5   # MeshCmd::Colormap    — variable name + RGB table
 MSG_TYPE_UPDATE     =  2   # MeshCmd::Update      — flip: make all buffered meshes active
 MSG_TYPE_BOUNDS     = 11   # MeshCmd::Bounds      — computational domain AABB (6 floats)
 MSG_TYPE_VISIBILITY = 12   # MeshCmd::Visibility  — show/hide a named mesh actor
+MSG_TYPE_PROJECT    = 13   # MeshCmd::Project     — project/stream name (for a DataManager cache)
+MSG_TYPE_TIME       = 14   # MeshCmd::Time        — current pipeline time, once per frame
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1076,8 @@ class PVLinkDomainBoundsFilter(VTKPythonAlgorithmBase):
         self._ymin = 0.0; self._ymax = 1.0
         self._zmin = 0.0; self._zmax = 1.0
         self._last_bounds = None   # last sent bounds tuple; avoids re-sending every frame
+        self._project           = "default"
+        self._last_project_sent = None   # dedup, same pattern as _last_bounds
 
     def FillOutputPortInformation(self, port, info):
         # Mirrors vtkPassInputTypeAlgorithm: declare output as the most general
@@ -1097,6 +1108,21 @@ class PVLinkDomainBoundsFilter(VTKPythonAlgorithmBase):
 
     def GetTCPPort(self):
         return self._port
+
+    @smproperty.stringvector(name="ProjectName", default_values="default")
+    @smdomain.xml("""
+        <Documentation>
+            Identifies this stream to a downstream DataManager cache — sent
+            once (and replayed on reconnect) as MSG_TYPE_PROJECT.  Does not
+            affect a direct ParaView-to-receiver connection.
+        </Documentation>
+    """)
+    def SetProjectName(self, val):
+        self._project = val
+        self.Modified()
+
+    def GetProjectName(self):
+        return self._project
 
     # ------------------------------------------------------------------
     # Override toggle
@@ -1206,6 +1232,26 @@ class PVLinkDomainBoundsFilter(VTKPythonAlgorithmBase):
 
         mgr = get_pvlink_manager()
         mgr.set_address(self._host, self._port)
+
+        # Project name — sent once (dedup, same pattern as bounds below) and
+        # cached for reconnect replay, so a DataManager knows which cache
+        # directory this stream belongs to.
+        if self._project != self._last_project_sent:
+            self._last_project_sent = self._project
+            name_bytes = self._project.encode('utf-8')
+            project_payload = struct.pack('<i', len(name_bytes)) + name_bytes
+            mgr._sender.register_state('project', MSG_TYPE_PROJECT, project_payload)
+            print(f"PVLink:sent project name '{self._project}'")
+
+        # Current pipeline time — sent every frame, unconditionally, as the
+        # per-frame marker a DataManager uses to key its recording.  Falls
+        # back to 0.0 if nothing upstream ever requested a specific time
+        # (e.g. a purely static dataset with no animation).
+        from vtkmodules.vtkCommonExecutionModel import vtkStreamingDemandDrivenPipeline as SDDP
+        out_info = outInfo.GetInformationObject(0)
+        current_time = out_info.Get(SDDP.UPDATE_TIME_STEP()) if out_info.Has(SDDP.UPDATE_TIME_STEP()) else 0.0
+        mgr.send_message(MSG_TYPE_TIME, struct.pack('<d', current_time))
+
         payload = struct.pack('<6f', *bounds)
 
         # Always keep replay state current.  Only wire-send when bounds change.

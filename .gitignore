@@ -27,6 +27,9 @@ pvOut.txt
 ms.out
 *.out
 
+# DataManager recorded/cached data (generated, not source)
+DataManager/recordings/
+
 # Claude/agent working files
 AGENTS.md
 HEARTBEAT.md
