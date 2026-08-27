@@ -55,7 +55,7 @@ Wire format (little-endian)
     (empty — 0 bytes)
 """
 
-PVLINK_VERSION = "1.19"
+PVLINK_VERSION = "1.20"
 
 import socket
 import struct
@@ -380,10 +380,6 @@ class PVLinkConnectionManager:
         self._sender  = _DirectSender()
         self._watcher = _ColormapWatcher(self._sender)
         self._sender.start()
-        self._meshes_pending      = False   # True when ≥1 mesh was sent this cycle
-        self._update_timer        = None    # threading.Timer for debounced UPDATE
-        self._render_window       = None    # vtkRenderWindow being observed (kept for cleanup)
-        self._render_observer_tag = None    # observer handle (kept for cleanup)
 
     # --- address management --------------------------------------------------
 
@@ -432,50 +428,30 @@ class PVLinkConnectionManager:
         self._sender.send_update()
 
     def mark_mesh_sent(self):
-        """Signal that a mesh was sent this pipeline cycle.
-        Resets a 50 ms debounce timer; when it fires (after all MeshSenders
-        in the pipeline have run) a single UPDATE is sent to the receiver so
-        all meshes flip atomically."""
-        self._meshes_pending = True
-        if self._update_timer is not None:
-            self._update_timer.cancel()
-        self._update_timer = threading.Timer(0.05, self._deferred_update)
-        self._update_timer.daemon = True
-        self._update_timer.start()
+        """Called right after a mesh has been (re)sent — sends UPDATE and blocks
+        for the ack immediately, on the calling thread.
 
-    def _deferred_update(self):
-        """Called from the debounce timer thread — send UPDATE if still pending."""
-        if not self._meshes_pending:
-            return
-        self._meshes_pending = False
+        Previously this coalesced sends via a 50ms debounce timer (and a
+        render-window StartEvent observer as a second trigger), so that
+        multiple MeshSenders in one pipeline cycle would flip Unity's buffers
+        together in a single UPDATE.  Under the Animation Scene's Play(),
+        RequestData for successive frames can run faster than the 50ms
+        window, so the timer kept getting cancelled and rescheduled and no
+        UPDATE was ever sent — Unity silently fell further and further behind
+        with no error, since mesh/colormap sends themselves always succeeded.
+        Sending synchronously here means RequestData — which runs on
+        whatever thread is driving the pipeline, including the animation
+        player — cannot return until Unity has actually swapped this mesh
+        in, so ParaView naturally paces itself to what Unity can keep up
+        with instead of racing ahead. The cost is one ack round-trip per
+        mesh sender instead of one per frame, and meshes from the same frame
+        may flip a beat apart rather than atomically — an acceptable trade
+        for never silently dropping frames.
+        """
         try:
             self._sender.send_update()
         except Exception as exc:
-            print(f"PVLink: deferred UPDATE failed — {exc}", flush=True)
-
-    def register_render_observer(self, view):
-        """Attach a one-time StartEvent observer to the render window so that
-        a single UPDATE is sent after the full pipeline has executed."""
-        if self._render_observer_tag is not None:
-            return
-        try:
-            rw = view.GetClientSideObject().GetRenderWindow()
-            if rw is None:
-                print("PVLink: no render window — UPDATE will be sent per-mesh (unsync'd)", flush=True)
-                return
-            mgr = self
-            def _on_start_render(obj, event):
-                if mgr._meshes_pending:
-                    mgr._meshes_pending = False
-                    try:
-                        mgr._sender.send_update()
-                    except Exception as exc:
-                        print(f"PVLink: render-triggered UPDATE failed — {exc}", flush=True)
-            self._render_observer_tag = rw.AddObserver('StartEvent', _on_start_render)
-            self._render_window       = rw
-            print("PVLink: render observer registered — UPDATE deferred to end of pipeline", flush=True)
-        except Exception as exc:
-            print(f"PVLink: could not register render observer — {exc}", flush=True)
+            print(f"PVLink: mark_mesh_sent — UPDATE failed — {exc}", flush=True)
 
     def watch_colormap(self, var_name, lut=None):
         self._watcher.watch(var_name, lut=lut)
@@ -903,7 +879,7 @@ class PVLinkMeshSenderFilter(VTKPythonAlgorithmBase):
             print(f"PVLink:sent '{self._mesh_name}' — "
                   f"{inp.GetNumberOfPoints()} pts, "
                   f"{inp.GetNumberOfCells()} cells, {scalar_desc}")
-            mgr.mark_mesh_sent()   # deferred UPDATE fires via render observer
+            mgr.mark_mesh_sent()   # blocks until Unity acks the flip
 
         return 1
 
@@ -927,7 +903,6 @@ class PVLinkMeshSenderFilter(VTKPythonAlgorithmBase):
             if view is None:
                 print(f"PVLink: no view found for '{self._mesh_name}' — color-by observer skipped", flush=True)
                 return
-            mgr.register_render_observer(view)
             # Find the proxy for *this* filter by comparing the underlying VTK
             # client-side object against self.  GetGlobalIDAsString() is a proxy
             # method and is not available on the raw VTK algorithm (self).
