@@ -1,7 +1,7 @@
 {
   "dependencies": {
     "com.paraviewlink.unity": {
-      "version": "file:/Users/gda/Documents/Claw/Projects/PVLink/ParaViewLinkUnity",
+      "version": "file:../../../ParaViewLinkUnity",
       "depth": 0,
       "source": "local",
       "dependencies": {}
