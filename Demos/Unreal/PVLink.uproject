@@ -3,7 +3,14 @@
 	"EngineAssociation": "5.8",
 	"Category": "",
 	"Description": "",
+	"AdditionalPluginDirectories": [
+		"../.."
+	],
 	"Plugins": [
+		{
+			"Name": "ParaViewLink",
+			"Enabled": true
+		},
 		{
 			"Name": "OpenXR",
 			"Enabled": true
