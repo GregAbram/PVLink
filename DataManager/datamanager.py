@@ -2,11 +2,18 @@
 DataManager -- Stage 1 (+ recording): transparent single-client relay,
 with an optional on-disk cache of everything that passes through.
 =========================================================================
-Sits between a PVLink data source (the ParaView PVLink plugin) and a single
-PVLink-enabled receiver (Unity/Unreal), relaying every message byte-for-byte.
-Requires no changes to Unity/Unreal receivers -- from the receiver's side,
-being connected to by the DataManager looks identical to being connected to
-directly by ParaView.
+Sits between a PVLink data source (the ParaView PVLink plugin) and one or
+more PVLink-enabled receivers (Unity/Unreal), relaying every message
+byte-for-byte to each of them. Requires no changes to Unity/Unreal
+receivers -- from each receiver's side, being connected to by the
+DataManager looks identical to being connected to directly by ParaView.
+
+Each --downstream target is connected to independently. If one fails to
+connect, or drops mid-session, it's dropped from the live set and the rest
+keep going -- one dead/slow receiver doesn't take the others down or block
+the source. MSG_TYPE_UPDATE backpressure (see PVLink.py's send_update) waits
+for an ack from every still-live downstream before acking the source, so a
+slow client is what the source waits on, not just the first one.
 
 If --cache-dir is given, every message is ALSO written to disk as it passes
 through, in a format replay.py can read back and stream to a receiver with
@@ -36,7 +43,7 @@ resend it," with no re-serialization on either end.
 
 Usage:
     python datamanager.py --listen-port 9000 \
-                           --downstream-host 127.0.0.1 --downstream-port 9001 \
+                           --downstream 127.0.0.1:9001 --downstream 127.0.0.1:9002 \
                            --cache-dir ./recordings
 """
 
@@ -175,23 +182,33 @@ class Recorder:
             self.bounds_written = True
 
 
-def relay_source_connection(source_sock, source_addr, downstream_host, downstream_port, cache_root):
-    """Relay one source (ParaView) connection to a single downstream receiver
-    until either side closes, optionally recording every message.  Runs on
-    its own thread."""
+def connect_downstream(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    sock.connect((host, port))
+    sock.settimeout(None)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return sock
+
+
+def relay_source_connection(source_sock, source_addr, downstream_targets, cache_root):
+    """Relay one source (ParaView) connection to every downstream receiver in
+    downstream_targets (a list of (host, port) pairs) until the source
+    closes, optionally recording every message.  Runs on its own thread."""
     print(f"[DataManager] source connected from {source_addr}", flush=True)
 
-    downstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    downstream.settimeout(5.0)
-    try:
-        downstream.connect((downstream_host, downstream_port))
-    except OSError as exc:
-        print(f"[DataManager] could not reach downstream {downstream_host}:{downstream_port} -- {exc}", flush=True)
+    downstreams = {}   # (host, port) -> socket, only the currently-live ones
+    for host, port in downstream_targets:
+        try:
+            downstreams[(host, port)] = connect_downstream(host, port)
+            print(f"[DataManager] relaying {source_addr} -> {host}:{port}", flush=True)
+        except OSError as exc:
+            print(f"[DataManager] could not reach downstream {host}:{port} -- {exc}", flush=True)
+
+    if not downstreams:
+        print(f"[DataManager] no downstream reachable for {source_addr} -- aborting session", flush=True)
         source_sock.close()
         return
-    downstream.settimeout(None)
-    downstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    print(f"[DataManager] relaying {source_addr} -> {downstream_host}:{downstream_port}", flush=True)
 
     recorder = Recorder(cache_root) if cache_root else None
     msg_count = 0
@@ -210,7 +227,19 @@ def relay_source_connection(source_sock, source_addr, downstream_host, downstrea
                     print(f"[DataManager] source {source_addr} closed mid-message", flush=True)
                     break
 
-            downstream.sendall(header + payload)
+            message = header + payload
+            for key in list(downstreams.keys()):
+                try:
+                    downstreams[key].sendall(message)
+                except OSError as exc:
+                    host, port = key
+                    print(f"[DataManager] lost downstream {host}:{port}: {exc}", flush=True)
+                    downstreams.pop(key).close()
+
+            if not downstreams:
+                print(f"[DataManager] all downstreams gone for {source_addr} -- ending session", flush=True)
+                break
+
             msg_count += 1
 
             if recorder is not None:
@@ -230,17 +259,37 @@ def relay_source_connection(source_sock, source_addr, downstream_host, downstrea
                 # every mesh sender) is what actually marks a new timestep.
 
             if msg_type == MSG_TYPE_UPDATE:
-                ack = recv_exact(downstream, 4)
-                if ack is None:
-                    print("[DataManager] downstream closed while waiting for UPDATE ack", flush=True)
+                # Wait for an ack from every still-live downstream before
+                # acking the source, so backpressure applies against the
+                # slowest client, not just the first one to respond.
+                worst_status = 0
+                for key in list(downstreams.keys()):
+                    sock = downstreams[key]
+                    sock.settimeout(30.0)
+                    ack = recv_exact(sock, 4)
+                    sock.settimeout(None)
+                    host, port = key
+                    if ack is None:
+                        print(f"[DataManager] downstream {host}:{port} closed/timed out waiting for UPDATE ack", flush=True)
+                        downstreams.pop(key).close()
+                        continue
+                    status = struct.unpack('<i', ack)[0]
+                    if status != 0:
+                        print(f"[DataManager] downstream {host}:{port} returned non-zero UPDATE ack status {status}", flush=True)
+                        worst_status = status
+
+                if not downstreams:
+                    print(f"[DataManager] all downstreams gone for {source_addr} -- ending session", flush=True)
                     break
-                source_sock.sendall(ack)
+
+                source_sock.sendall(struct.pack('<i', worst_status))
     except (OSError, ConnectionError) as exc:
         print(f"[DataManager] relay error for {source_addr}: {exc}", flush=True)
     finally:
         if recorder is not None:
             recorder._finalize_current_timestep()
-        downstream.close()
+        for sock in downstreams.values():
+            sock.close()
         source_sock.close()
         print(f"[DataManager] session with {source_addr} ended after {msg_count} message(s)", flush=True)
 
@@ -251,13 +300,19 @@ def main():
                          help='address to listen on for the source (ParaView) connection')
     parser.add_argument('--listen-port', type=int, default=9000,
                          help='port to listen on for the source (ParaView) connection')
-    parser.add_argument('--downstream-host', default='127.0.0.1',
-                         help='host of the downstream receiver (Unity/Unreal)')
-    parser.add_argument('--downstream-port', type=int, required=True,
-                         help='port of the downstream receiver (Unity/Unreal)')
+    parser.add_argument('--downstream', action='append', required=True, metavar='HOST:PORT',
+                         help='a downstream receiver (Unity/Unreal) to relay to, as host:port. '
+                              'Repeat for multiple clients.')
     parser.add_argument('--cache-dir', default=None,
                          help='if given, record every project/timestep to this directory')
     args = parser.parse_args()
+
+    downstream_targets = []
+    for target in args.downstream:
+        host, _, port = target.rpartition(':')
+        if not host or not port.isdigit():
+            parser.error(f"--downstream target must be host:port, got '{target}'")
+        downstream_targets.append((host, int(port)))
 
     if args.cache_dir:
         os.makedirs(args.cache_dir, exist_ok=True)
@@ -266,8 +321,9 @@ def main():
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((args.listen_host, args.listen_port))
     listener.listen(5)
+    targets_str = ', '.join(f'{h}:{p}' for h, p in downstream_targets)
     print(f"[DataManager] listening on {args.listen_host}:{args.listen_port}, "
-          f"relaying to {args.downstream_host}:{args.downstream_port}"
+          f"relaying to [{targets_str}]"
           + (f", recording to {args.cache_dir}" if args.cache_dir else ""), flush=True)
 
     try:
@@ -276,7 +332,7 @@ def main():
             source_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(
                 target=relay_source_connection,
-                args=(source_sock, source_addr, args.downstream_host, args.downstream_port, args.cache_dir),
+                args=(source_sock, source_addr, downstream_targets, args.cache_dir),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
