@@ -8,7 +8,9 @@ class FSocketReceiverRunnable;
 class FSocketSenderRunnable;
 
 /**
- * Base singleton socket manager — inbound (port 9001) + outbound (port 9002).
+ * Base singleton socket manager — dials out to the DataManager (inbound
+ * messages) + a still-unused outbound (port 9002) listener for a UE→Python
+ * direction nothing in this plugin currently sends on.
  * Automatically created with the Game Instance; nothing needs placing in the level.
  *
  * Subclass this and override HandleRawMessage() to process inbound messages.
@@ -16,8 +18,9 @@ class FSocketSenderRunnable;
  * Push work to a TQueue and process it in a Tick (see UMeshReceiverSubsystem).
  *
  * DefaultGame.ini:
- *   [/Script/Greg.SocketReceiverSubsystem]
- *   InboundPort=9001
+ *   [/Script/ParaViewLink.SocketReceiverSubsystem]
+ *   DataManagerHost=127.0.0.1
+ *   DataManagerPort=9010
  *   OutboundPort=9002
  */
 UCLASS()

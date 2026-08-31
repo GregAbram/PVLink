@@ -21,12 +21,14 @@ void USocketReceiverSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
 
-    int32 InboundPort  = 9001;
-    int32 OutboundPort = 9002;
-    GConfig->GetInt(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("InboundPort"),  InboundPort,  GGameIni);
+    FString DataManagerHost = TEXT("127.0.0.1");
+    int32   DataManagerPort = 9010;
+    int32   OutboundPort    = 9002;
+    GConfig->GetString(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("DataManagerHost"), DataManagerHost, GGameIni);
+    GConfig->GetInt(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("DataManagerPort"), DataManagerPort, GGameIni);
     GConfig->GetInt(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("OutboundPort"), OutboundPort, GGameIni);
 
-    Receiver = new FSocketReceiverRunnable(InboundPort);
+    Receiver = new FSocketReceiverRunnable(DataManagerHost, DataManagerPort);
 
     // Bind the callback — captures 'this', cleared in Deinitialize before thread stops.
     Receiver->OnMessageReceived = [this](int32 Cmd, TArray<uint8> Payload)
@@ -39,8 +41,8 @@ void USocketReceiverSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     Sender       = new FSocketSenderRunnable(OutboundPort);
     SenderThread = FRunnableThread::Create(Sender, TEXT("SocketSenderThread"));
 
-    UE_LOG(LogTemp, Warning, TEXT("SocketReceiverSubsystem: Inbound=%d  Outbound=%d"),
-           InboundPort, OutboundPort);
+    UE_LOG(LogTemp, Warning, TEXT("SocketReceiverSubsystem: DataManager=%s:%d  Outbound=%d"),
+           *DataManagerHost, DataManagerPort, OutboundPort);
 }
 
 void USocketReceiverSubsystem::Deinitialize()

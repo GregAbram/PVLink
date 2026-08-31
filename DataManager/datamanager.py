@@ -1,31 +1,44 @@
 """
-DataManager -- Stage 1 (+ recording): transparent single-client relay,
-with an optional on-disk cache of everything that passes through.
+DataManager -- clients dial in; relays a live ParaView source, or replays a
+cached project straight from disk with no ParaView involved at all.
 =========================================================================
-Sits between a PVLink data source (the ParaView PVLink plugin) and one or
-more PVLink-enabled receivers (Unity/Unreal), relaying every message
-byte-for-byte to each of them. Requires no changes to Unity/Unreal
-receivers -- from each receiver's side, being connected to by the
-DataManager looks identical to being connected to directly by ParaView.
+Unity/Unreal clients connect INTO the DataManager (on --client-port) rather
+than the DataManager dialing out to them -- clients can join and leave
+freely, with no restart and no advance knowledge of who's connecting. A
+newly-joined client is caught up to current state (project name, colormaps,
+bounds, time, visibility, and every mesh's latest geometry) before it's
+added to the live broadcast set, so it doesn't just see a blank scene until
+the next update (which, for a paused/static viz, might never come).
 
-Each --downstream target is connected to independently. If one fails to
-connect, or drops mid-session, it's dropped from the live set and the rest
-keep going -- one dead/slow receiver doesn't take the others down or block
-the source. MSG_TYPE_UPDATE backpressure (see PVLink.py's send_update) waits
-for an ack from every still-live downstream before acking the source, so a
-slow client is what the source waits on, not just the first one.
+Two mutually-exclusive run modes, chosen by whether --project is given:
 
-If --cache-dir is given, every message is ALSO written to disk as it passes
-through, in a format replay.py can read back and stream to a receiver with
-no live ParaView needed:
+  Live mode (no --project): --listen-port accepts a ParaView source
+  connection exactly as before; every message is broadcast to every
+  connected client. If --cache-dir is given, everything is ALSO written to
+  disk as it passes through (see Recorder below).
+
+  Replay mode (--project NAME): no --listen-port is opened at all -- the
+  DataManager reads a previously-recorded project from
+  <cache-dir>/NAME and streams it through the exact same client-broadcast
+  pipeline live ParaView traffic would use, looping indefinitely by
+  default. Pacing is ack-driven: after each timestep's UPDATE is
+  broadcast, the DataManager waits for every live client to ack before
+  moving on (the same backpressure PVLink.py's mark_mesh_sent() already
+  uses against a live source) -- --replay-delay is only a floor on top of
+  that, not the primary pacer, so a slow client is what sets the pace, not
+  a blind guess.
+
+On-disk cache layout (written by Recorder in live mode, read by replay
+mode) -- every file is the exact payload bytes already built for the
+socket, so recording is "write what I already have" and replay is "read it
+back and resend it," with no re-serialization on either end:
 
     <cache-dir>/<project>/
       meta.json
       colormaps/
         <variable-name>.bin      # raw COLORMAP payload, overwritten in place
-                                  # (colormap is timestep-independent -- see
-                                  # replay.py, which sends these once, up
-                                  # front, so they apply to the whole replay)
+                                  # (colormap is timestep-independent -- sent
+                                  # once, up front, applies to the whole replay)
       timesteps/
         000000/
           time.bin                # raw TIME payload (float64)
@@ -37,17 +50,18 @@ no live ParaView needed:
         000001/
           ...
 
-Every on-disk file is the exact payload bytes already built for the socket
--- recording is "write what I already have," replay is "read it back and
-resend it," with no re-serialization on either end.
-
 Usage:
-    python datamanager.py --listen-port 9000 \
-                           --downstream 127.0.0.1:9001 --downstream 127.0.0.1:9002 \
+    # Live: relay ParaView, clients dial into 9010, also record to disk
+    python datamanager.py --listen-port 9000 --client-port 9010 \
                            --cache-dir ./recordings
+
+    # Replay: no ParaView needed, serve a previously-recorded project
+    python datamanager.py --client-port 9010 \
+                           --cache-dir ./recordings --project Sphere
 """
 
 import argparse
+import glob
 import json
 import os
 import socket
@@ -77,10 +91,31 @@ def recv_exact(sock, n):
     return buf
 
 
+def _frame(msg_type, payload):
+    return struct.pack('<ii', len(payload), msg_type) + payload
+
+
+def _read_name(payload, offset=0):
+    """Read a length-prefixed UTF-8 name: int32 name_len followed by that
+    many bytes, starting at offset. Shared by PROJECT/COLORMAP/VISIBILITY,
+    which all lead with this same shape."""
+    name_len = struct.unpack('<i', payload[offset:offset + 4])[0]
+    return payload[offset + 4:offset + 4 + name_len].decode('utf-8')
+
+
+def _mesh_name(payload):
+    """MESH payload name extraction -- the name's length lives at a fixed
+    offset (after other header fields) and the name itself is the LAST
+    bytes of the payload, not immediately after its length."""
+    _, mesh_name_len = struct.unpack('<ii', payload[16:24])
+    return payload[-mesh_name_len:].decode('utf-8') if mesh_name_len > 0 else 'ParaViewMesh'
+
+
 class Recorder:
     """Tracks the current project/timestep and writes payloads to disk.
     A no-op (every method just returns) until a MSG_TYPE_PROJECT message
-    tells it where to write.
+    tells it where to write.  Live mode only -- replay mode reads this same
+    layout back but never records (there's nothing new to record).
 
     The timestep boundary is NOT MSG_TYPE_UPDATE (each mesh sender fires its
     own UPDATE for live-sync backpressure -- keying off it splits one real
@@ -112,8 +147,7 @@ class Recorder:
         return d
 
     def on_project(self, payload):
-        name_len = struct.unpack('<i', payload[:4])[0]
-        name = payload[4:4 + name_len].decode('utf-8')
+        name = _read_name(payload)
         self.project_dir = os.path.join(self.cache_root, name)
         os.makedirs(os.path.join(self.project_dir, 'colormaps'), exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'timesteps'), exist_ok=True)
@@ -129,8 +163,7 @@ class Recorder:
     def on_colormap(self, payload):
         if self.project_dir is None:
             return
-        name_len = struct.unpack('<i', payload[:4])[0]
-        name = payload[4:4 + name_len].decode('utf-8')
+        name = _read_name(payload)
         with open(os.path.join(self.project_dir, 'colormaps', f'{name}.bin'), 'wb') as f:
             f.write(payload)
 
@@ -157,8 +190,7 @@ class Recorder:
         new one before writing it."""
         if self.project_dir is None:
             return
-        color_name_len, mesh_name_len = struct.unpack('<ii', payload[16:24])
-        mesh_name = payload[-mesh_name_len:].decode('utf-8') if mesh_name_len > 0 else 'ParaViewMesh'
+        mesh_name = _mesh_name(payload)
 
         if mesh_name in self.meshes_in_current:
             self._finalize_current_timestep()
@@ -182,33 +214,177 @@ class Recorder:
             self.bounds_written = True
 
 
-def connect_downstream(host, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
-    sock.connect((host, port))
-    sock.settimeout(None)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    return sock
+class ClientRegistry:
+    """Thread-safe set of live downstream client sockets that dial INTO the
+    DataManager. Used by both the live ParaView relay and disk replay to
+    broadcast to whichever clients happen to be connected right now."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients = {}   # addr -> socket
+
+    def add(self, addr, sock):
+        with self._lock:
+            self._clients[addr] = sock
+            count = len(self._clients)
+        print(f"[DataManager] client {addr} live ({count} total)", flush=True)
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._clients.items())
+
+    def _drop(self, addr, reason):
+        with self._lock:
+            sock = self._clients.pop(addr, None)
+        if sock is not None:
+            print(f"[DataManager] client {addr} dropped -- {reason}", flush=True)
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def broadcast(self, message):
+        """Send raw framed bytes to every live client; drop any that fail."""
+        for addr, sock in self.snapshot():
+            try:
+                sock.sendall(message)
+            except OSError as exc:
+                self._drop(addr, str(exc))
+
+    def collect_update_acks(self):
+        """After an UPDATE broadcast, wait for a 4-byte ack from every
+        still-live client (dropping any that time out or disconnect) and
+        return the aggregated status: 0 if all OK, else the worst non-zero
+        status seen."""
+        worst_status = 0
+        for addr, sock in self.snapshot():
+            sock.settimeout(30.0)
+            ack = recv_exact(sock, 4)
+            sock.settimeout(None)
+            if ack is None:
+                self._drop(addr, "closed/timed out waiting for UPDATE ack")
+                continue
+            status = struct.unpack('<i', ack)[0]
+            if status != 0:
+                print(f"[DataManager] client {addr} returned non-zero UPDATE ack status {status}", flush=True)
+                worst_status = status
+        return worst_status
 
 
-def relay_source_connection(source_sock, source_addr, downstream_targets, cache_root):
-    """Relay one source (ParaView) connection to every downstream receiver in
-    downstream_targets (a list of (host, port) pairs) until the source
-    closes, optionally recording every message.  Runs on its own thread."""
-    print(f"[DataManager] source connected from {source_addr}", flush=True)
+class LatestState:
+    """In-memory cache of the most recently seen payload per category, used
+    to catch a newly-joined client up to current state without waiting for
+    the next live update (which, for a paused/static viz, might never come).
+    Always active, independent of --cache-dir/Recorder."""
 
-    downstreams = {}   # (host, port) -> socket, only the currently-live ones
-    for host, port in downstream_targets:
+    def __init__(self):
+        self.project_payload     = None
+        self.colormap_payloads   = {}   # name -> bytes
+        self.bounds_payload      = None
+        self.time_payload        = None
+        self.visibility_payloads = {}   # name -> bytes
+        self.mesh_payloads       = {}   # name -> bytes
+
+    def update(self, msg_type, payload):
+        if msg_type == MSG_TYPE_PROJECT:
+            # New project -- old cached state no longer applies.
+            self.project_payload = payload
+            self.colormap_payloads   = {}
+            self.bounds_payload      = None
+            self.time_payload        = None
+            self.visibility_payloads = {}
+            self.mesh_payloads       = {}
+        elif msg_type == MSG_TYPE_COLORMAP:
+            self.colormap_payloads[_read_name(payload)] = payload
+        elif msg_type == MSG_TYPE_BOUNDS:
+            self.bounds_payload = payload
+        elif msg_type == MSG_TYPE_TIME:
+            self.time_payload = payload
+        elif msg_type == MSG_TYPE_VISIBILITY:
+            self.visibility_payloads[_read_name(payload)] = payload
+        elif msg_type == MSG_TYPE_MESH:
+            self.mesh_payloads[_mesh_name(payload)] = payload
+
+    def has_any(self):
+        return self.project_payload is not None or bool(self.mesh_payloads)
+
+    def catch_up_frames(self):
+        """Ordered (msg_type, payload) list to replay to a newly-joined
+        client. Order doesn't affect correctness -- each type is applied
+        independently on the receiver side -- this is just a sensible
+        default ordering."""
+        frames = []
+        if self.project_payload is not None:
+            frames.append((MSG_TYPE_PROJECT, self.project_payload))
+        for payload in self.colormap_payloads.values():
+            frames.append((MSG_TYPE_COLORMAP, payload))
+        if self.bounds_payload is not None:
+            frames.append((MSG_TYPE_BOUNDS, self.bounds_payload))
+        if self.time_payload is not None:
+            frames.append((MSG_TYPE_TIME, self.time_payload))
+        for payload in self.visibility_payloads.values():
+            frames.append((MSG_TYPE_VISIBILITY, payload))
+        for payload in self.mesh_payloads.values():
+            frames.append((MSG_TYPE_MESH, payload))
+        return frames
+
+
+def emit(msg_type, payload, registry, latest_state):
+    """One message from whichever producer is currently active (live
+    ParaView source or disk replay): remember it for catch-up, then
+    broadcast it to every live client."""
+    latest_state.update(msg_type, payload)
+    registry.broadcast(_frame(msg_type, payload))
+
+
+def handle_new_client(sock, addr, registry, latest_state):
+    """Catch a newly-connected client up to current state, then add it to
+    the live broadcast set. Runs on its own thread so multiple clients
+    joining concurrently don't block each other. Never adds a client that
+    fails mid-handshake, and never races a concurrent broadcast -- the
+    client is only added to the registry after catch-up fully completes."""
+    print(f"[DataManager] client connecting from {addr}", flush=True)
+    try:
+        frames = latest_state.catch_up_frames()
+        for msg_type, payload in frames:
+            sock.sendall(_frame(msg_type, payload))
+
+        if latest_state.has_any():
+            sock.sendall(_frame(MSG_TYPE_UPDATE, b''))
+            sock.settimeout(10.0)
+            ack = recv_exact(sock, 4)
+            sock.settimeout(None)
+            if ack is None:
+                print(f"[DataManager] client {addr} disconnected during catch-up", flush=True)
+                sock.close()
+                return
+            print(f"[DataManager] client {addr} caught up ({len(frames)} frame(s))", flush=True)
+
+        registry.add(addr, sock)
+    except OSError as exc:
+        print(f"[DataManager] client {addr} catch-up failed: {exc}", flush=True)
         try:
-            downstreams[(host, port)] = connect_downstream(host, port)
-            print(f"[DataManager] relaying {source_addr} -> {host}:{port}", flush=True)
-        except OSError as exc:
-            print(f"[DataManager] could not reach downstream {host}:{port} -- {exc}", flush=True)
+            sock.close()
+        except OSError:
+            pass
 
-    if not downstreams:
-        print(f"[DataManager] no downstream reachable for {source_addr} -- aborting session", flush=True)
-        source_sock.close()
-        return
+
+def client_accept_loop(client_listener, registry, latest_state):
+    while True:
+        sock, addr = client_listener.accept()
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(
+            target=handle_new_client,
+            args=(sock, addr, registry, latest_state),
+            daemon=True,
+        ).start()
+
+
+def relay_source_connection(source_sock, source_addr, registry, latest_state, cache_root):
+    """Relay one live ParaView source connection to every currently-live
+    client, optionally recording every message to disk. Runs on its own
+    thread."""
+    print(f"[DataManager] source connected from {source_addr}", flush=True)
 
     recorder = Recorder(cache_root) if cache_root else None
     msg_count = 0
@@ -227,19 +403,8 @@ def relay_source_connection(source_sock, source_addr, downstream_targets, cache_
                     print(f"[DataManager] source {source_addr} closed mid-message", flush=True)
                     break
 
-            message = header + payload
-            for key in list(downstreams.keys()):
-                try:
-                    downstreams[key].sendall(message)
-                except OSError as exc:
-                    host, port = key
-                    print(f"[DataManager] lost downstream {host}:{port}: {exc}", flush=True)
-                    downstreams.pop(key).close()
-
-            if not downstreams:
-                print(f"[DataManager] all downstreams gone for {source_addr} -- ending session", flush=True)
-                break
-
+            latest_state.update(msg_type, payload)
+            registry.broadcast(header + payload)
             msg_count += 1
 
             if recorder is not None:
@@ -255,64 +420,148 @@ def relay_source_connection(source_sock, source_addr, downstream_targets, cache_
                     recorder.on_mesh(payload)
                 # MSG_TYPE_UPDATE is intentionally NOT a recorder trigger --
                 # each mesh sender fires its own UPDATE for live-sync
-                # backpressure, but TIME (once per real frame, upstream of
-                # every mesh sender) is what actually marks a new timestep.
+                # backpressure; a repeated mesh name is the real timestep
+                # boundary (see Recorder.on_mesh).
 
             if msg_type == MSG_TYPE_UPDATE:
-                # Wait for an ack from every still-live downstream before
-                # acking the source, so backpressure applies against the
-                # slowest client, not just the first one to respond.
-                worst_status = 0
-                for key in list(downstreams.keys()):
-                    sock = downstreams[key]
-                    sock.settimeout(30.0)
-                    ack = recv_exact(sock, 4)
-                    sock.settimeout(None)
-                    host, port = key
-                    if ack is None:
-                        print(f"[DataManager] downstream {host}:{port} closed/timed out waiting for UPDATE ack", flush=True)
-                        downstreams.pop(key).close()
-                        continue
-                    status = struct.unpack('<i', ack)[0]
-                    if status != 0:
-                        print(f"[DataManager] downstream {host}:{port} returned non-zero UPDATE ack status {status}", flush=True)
-                        worst_status = status
-
-                if not downstreams:
-                    print(f"[DataManager] all downstreams gone for {source_addr} -- ending session", flush=True)
-                    break
-
-                source_sock.sendall(struct.pack('<i', worst_status))
+                # Wait for an ack from every still-live client before acking
+                # the source, so backpressure applies against the slowest
+                # client, not just the first one to respond.
+                status = registry.collect_update_acks()
+                source_sock.sendall(struct.pack('<i', status))
     except (OSError, ConnectionError) as exc:
         print(f"[DataManager] relay error for {source_addr}: {exc}", flush=True)
     finally:
         if recorder is not None:
             recorder._finalize_current_timestep()
-        for sock in downstreams.values():
-            sock.close()
         source_sock.close()
         print(f"[DataManager] session with {source_addr} ended after {msg_count} message(s)", flush=True)
 
 
+def replay_project(project_dir, project_name, registry, latest_state, delay, loop):
+    """Stream a cached project from disk through the same registry/
+    latest_state pipeline a live ParaView source would use -- no socket of
+    its own. Pacing is ack-driven, not sleep-driven: after broadcasting an
+    UPDATE, collect_update_acks() is what triggers moving to the next
+    timestep, mirroring PVLink.py's own mark_mesh_sent() backpressure
+    against a live source. --delay only applies as a floor on top of that
+    (so replay isn't pointlessly fast when clients ack near-instantly, and
+    so it isn't fully idle-spinning when the registry is empty and acks
+    return immediately with nothing to wait for)."""
+    name_bytes = project_name.encode('utf-8')
+    emit(MSG_TYPE_PROJECT, struct.pack('<i', len(name_bytes)) + name_bytes, registry, latest_state)
+
+    colormap_files = sorted(glob.glob(os.path.join(project_dir, 'colormaps', '*.bin')))
+    for path in colormap_files:
+        with open(path, 'rb') as f:
+            payload = f.read()
+        emit(MSG_TYPE_COLORMAP, payload, registry, latest_state)
+        print(f"[DataManager] replay: sent colormap '{os.path.basename(path)}'", flush=True)
+
+    timestep_dirs = sorted(
+        d for d in glob.glob(os.path.join(project_dir, 'timesteps', '*'))
+        if os.path.isdir(d)
+    )
+    if not timestep_dirs:
+        print(f"[DataManager] replay: no timesteps found under {project_dir}", flush=True)
+        return
+
+    while True:
+        for tdir in timestep_dirs:
+            frame_start = time.monotonic()
+
+            bounds_path = os.path.join(tdir, 'bounds.bin')
+            if os.path.isfile(bounds_path):
+                with open(bounds_path, 'rb') as f:
+                    emit(MSG_TYPE_BOUNDS, f.read(), registry, latest_state)
+
+            time_path = os.path.join(tdir, 'time.bin')
+            if os.path.isfile(time_path):
+                with open(time_path, 'rb') as f:
+                    emit(MSG_TYPE_TIME, f.read(), registry, latest_state)
+
+            mesh_files = sorted(
+                p for p in glob.glob(os.path.join(tdir, '*.bin'))
+                if os.path.basename(p) not in ('bounds.bin', 'time.bin')
+            )
+            for mpath in mesh_files:
+                with open(mpath, 'rb') as f:
+                    emit(MSG_TYPE_MESH, f.read(), registry, latest_state)
+
+            registry.broadcast(_frame(MSG_TYPE_UPDATE, b''))
+            registry.collect_update_acks()
+
+            elapsed = time.monotonic() - frame_start
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+
+            print(f"[DataManager] replay: flipped {os.path.basename(tdir)} "
+                  f"({len(mesh_files)} mesh(es))", flush=True)
+
+        if not loop:
+            print("[DataManager] replay: finished (not looping)", flush=True)
+            break
+
+
 def main():
-    parser = argparse.ArgumentParser(description="PVLink DataManager -- Stage 1 transparent relay + recorder")
+    parser = argparse.ArgumentParser(
+        description="PVLink DataManager -- clients dial in; relays a live ParaView "
+                    "source or replays a cached project")
     parser.add_argument('--listen-host', default='0.0.0.0',
-                         help='address to listen on for the source (ParaView) connection')
+                         help='address to listen on for the ParaView source connection (live mode only)')
     parser.add_argument('--listen-port', type=int, default=9000,
-                         help='port to listen on for the source (ParaView) connection')
-    parser.add_argument('--downstream', action='append', required=True, metavar='HOST:PORT',
-                         help='a downstream receiver (Unity/Unreal) to relay to, as host:port. '
-                              'Repeat for multiple clients.')
+                         help='port to listen on for the ParaView source connection (live mode only)')
+    parser.add_argument('--client-host', default='0.0.0.0',
+                         help='address to listen on for Unity/Unreal clients to dial into')
+    parser.add_argument('--client-port', type=int, default=9010,
+                         help='port for Unity/Unreal clients to dial into')
     parser.add_argument('--cache-dir', default=None,
-                         help='if given, record every project/timestep to this directory')
+                         help='live mode: if given, record every project/timestep to this directory. '
+                              'replay mode: required -- --project is resolved under this directory.')
+    parser.add_argument('--project', default=None, metavar='NAME',
+                         help='replay a cached project (<cache-dir>/NAME) instead of waiting for a '
+                              'live ParaView source -- --listen-port is not opened in this mode')
+    parser.add_argument('--replay-delay', type=float, default=0.5,
+                         help='replay mode: minimum seconds between timesteps -- a floor on top of '
+                              'ack-driven pacing, not the primary pacer (default: 0.5)')
+    loop_group = parser.add_mutually_exclusive_group()
+    loop_group.add_argument('--loop', dest='loop', action='store_true', default=True,
+                             help='replay mode: loop the recording indefinitely (default)')
+    loop_group.add_argument('--no-loop', dest='loop', action='store_false',
+                             help='replay mode: play the recording once and stop')
     args = parser.parse_args()
 
-    downstream_targets = []
-    for target in args.downstream:
-        host, _, port = target.rpartition(':')
-        if not host or not port.isdigit():
-            parser.error(f"--downstream target must be host:port, got '{target}'")
-        downstream_targets.append((host, int(port)))
+    project_dir = None
+    if args.project:
+        if not args.cache_dir:
+            parser.error('--project requires --cache-dir (the project is read from <cache-dir>/<project>)')
+        project_dir = os.path.join(args.cache_dir, args.project)
+        if not os.path.isdir(project_dir):
+            parser.error(f"--project '{args.project}' not found under --cache-dir '{args.cache_dir}' "
+                         f"(expected {project_dir})")
+
+    registry = ClientRegistry()
+    latest_state = LatestState()
+
+    client_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    client_listener.bind((args.client_host, args.client_port))
+    client_listener.listen(5)
+    threading.Thread(
+        target=client_accept_loop,
+        args=(client_listener, registry, latest_state),
+        daemon=True,
+    ).start()
+
+    if project_dir is not None:
+        print(f"[DataManager] replay mode: '{args.project}' from {project_dir}, "
+              f"clients dial into {args.client_host}:{args.client_port}"
+              + (", looping" if args.loop else ", single pass"), flush=True)
+        try:
+            replay_project(project_dir, args.project, registry, latest_state, args.replay_delay, args.loop)
+        except KeyboardInterrupt:
+            print("[DataManager] shutting down", flush=True)
+        return
 
     if args.cache_dir:
         os.makedirs(args.cache_dir, exist_ok=True)
@@ -321,9 +570,8 @@ def main():
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((args.listen_host, args.listen_port))
     listener.listen(5)
-    targets_str = ', '.join(f'{h}:{p}' for h, p in downstream_targets)
-    print(f"[DataManager] listening on {args.listen_host}:{args.listen_port}, "
-          f"relaying to [{targets_str}]"
+    print(f"[DataManager] live mode: listening for ParaView on {args.listen_host}:{args.listen_port}, "
+          f"clients dial into {args.client_host}:{args.client_port}"
           + (f", recording to {args.cache_dir}" if args.cache_dir else ""), flush=True)
 
     try:
@@ -332,7 +580,7 @@ def main():
             source_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(
                 target=relay_source_connection,
-                args=(source_sock, source_addr, downstream_targets, args.cache_dir),
+                args=(source_sock, source_addr, registry, latest_state, args.cache_dir),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
