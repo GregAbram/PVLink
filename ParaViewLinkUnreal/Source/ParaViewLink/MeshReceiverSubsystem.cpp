@@ -2,6 +2,7 @@
 #include "SimContainerActor.h"
 #include "StreamedMeshActor.h"
 #include "Components/BoxComponent.h"
+#include "Engine/Engine.h"
 #include "Engine/Texture2D.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/Material.h"
@@ -11,6 +12,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
+#include "Materials/MaterialExpressionComponentMask.h"
 #include "Misc/PackageName.h"
 #include "UObject/SavePackage.h"
 
@@ -33,9 +35,20 @@ static UMaterial* CreateScalarFieldMaterial()
 
     UMaterial* Mat = NewObject<UMaterial>(Package, TEXT("M_ScalarField"),
                                           RF_Public | RF_Standalone);
-    // Emissive output is lighting-independent regardless of shading model,
-    // so DefaultLit is fine here.  TwoSided ensures both faces are visible.
-    Mat->TwoSided = true;
+    // BaseColor + DefaultLit (not Emissive) -- matches how both ParaView itself
+    // and the Unity receiver's actual shader (ScalarFieldLit.shader, despite
+    // M_ScalarField.mat's plain name) render this data: as a normally-lit
+    // surface. Emissive was tried first but made on-screen brightness purely a
+    // function of scene exposure/tonemapping settings rather than actual scene
+    // lighting, unlike either other platform.
+    //
+    // Not TwoSided: two-sided rendering is handled by AStreamedMeshActor
+    // duplicating geometry with reversed winding + flipped normals (see
+    // UpdateMesh), not by a two-sided material shader trick -- a TwoSided
+    // material renders both faces but does NOT flip the normal used for
+    // lighting on the back face, which reads as unexpectedly dark/wrong.
+    // Standard single-sided backface culling is exactly correct here since
+    // every visible face now has its own real, correctly-oriented copy.
 
     // VertexColor node — R channel carries the normalised scalar value [0,1].
     UMaterialExpressionVertexColor* VC =
@@ -44,6 +57,18 @@ static UMaterial* CreateScalarFieldMaterial()
     VC->MaterialExpressionEditorY =    0;
     Mat->GetExpressionCollection().AddExpression(VC);
 
+    // Explicit float4 -> float2 mask (R, G) — VertexColor outputs float4, and
+    // TextureSampleParameter2D's Coordinates input requires float2; this engine's
+    // material compiler rejects the implicit truncation, so mask it explicitly.
+    // G is always 0 in the uploaded vertex colours, giving UV = (T, 0).
+    UMaterialExpressionComponentMask* UVMask =
+        NewObject<UMaterialExpressionComponentMask>(Mat);
+    UVMask->MaterialExpressionEditorX = -300;
+    UVMask->MaterialExpressionEditorY =    0;
+    UVMask->Input.Expression = VC;
+    UVMask->R = 1; UVMask->G = 1; UVMask->B = 0; UVMask->A = 0;
+    Mat->GetExpressionCollection().AddExpression(UVMask);
+
     // Texture parameter — sampled at UV = (VertexColor.R, 0).
     // The subsystem sets the "Colormap" parameter to a 1D gradient texture.
     UMaterialExpressionTextureSampleParameter2D* TS =
@@ -51,11 +76,22 @@ static UMaterial* CreateScalarFieldMaterial()
     TS->ParameterName             = TEXT("Colormap");
     TS->MaterialExpressionEditorX = -200;
     TS->MaterialExpressionEditorY =    0;
-    TS->Coordinates.Expression    = VC;   // float4 VertexColor → UV (uses R,G = T,0)
+    TS->Coordinates.Expression    = UVMask;
+    // Material compilation requires a valid default texture on a Texture Sample
+    // node even though it's always overridden at runtime via
+    // SetTextureParameterValue -- use the engine's built-in default so this
+    // doesn't depend on any project-specific content existing.
+    TS->Texture = GEngine ? GEngine->DefaultTexture : nullptr;
     Mat->GetExpressionCollection().AddExpression(TS);
 
-    // Wire texture sample → EmissiveColor output.
-    Mat->GetEditorOnlyData()->EmissiveColor.Expression = TS;
+    // Wire texture sample straight to BaseColor -- a raw [0,1] sample is
+    // already the natural, correct range for diffuse albedo, no boost needed
+    // (unlike Emissive, which this material used originally; see comment above).
+    Mat->GetEditorOnlyData()->BaseColor.Expression = TS;
+
+    // Normal input is left at its default (tangent-space, unconnected = the
+    // mesh's own per-vertex normal from CachedNormals) -- correct as-is now
+    // that every face has a real, correctly-oriented copy.
 
     Mat->PreEditChange(nullptr);
     Mat->PostEditChange();
@@ -529,21 +565,30 @@ UTexture2D* UMeshReceiverSubsystem::CreateOrUpdateColormapTexture(
     {
         Tex = UTexture2D::CreateTransient(Width, 1, PF_B8G8R8A8,
             FName(*FString::Printf(TEXT("Colormap_%s"), *VarName)));
-        Tex->SRGB = 0;
+        // ParaView's colormap RGB values are display-ready sRGB-encoded colors,
+        // like any colormap LUT meant for direct screen display -- SRGB must be
+        // true so the engine gamma-decodes them to linear before lighting.
+        // Leaving this false (as it was) reads the sRGB-encoded bytes as if
+        // already linear, which washes out contrast/saturation.
+        Tex->SRGB = 1;
         Tex->CompressionSettings = TC_VectorDisplacementmap;
         Tex->Filter = TF_Bilinear;
         Tex->AddressX = TA_Clamp;   // prevent u=1.0 wrapping to the first texel
     }
 
-    // Write RGBA8 data
+    // Write BGRA8 data -- PF_B8G8R8A8's in-memory byte order is B,G,R,A, not
+    // R,G,B,A (a very easy pixel-format gotcha to miss: writing R into byte 0
+    // and B into byte 2 silently swaps red and blue, producing e.g. a reversed
+    // cool-to-warm colormap that can look merely "off"/oversaturated rather
+    // than obviously wrong).
     FTexture2DMipMap& Mip = Tex->GetPlatformData()->Mips[0];
     void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
     uint8* Pixels = static_cast<uint8*>(Data);
     for (int32 i = 0; i < Width; i++)
     {
-        Pixels[i * 4 + 0] = FMath::Clamp(FMath::RoundToInt(RGB[i].R * 255.f), 0, 255);
+        Pixels[i * 4 + 0] = FMath::Clamp(FMath::RoundToInt(RGB[i].B * 255.f), 0, 255);
         Pixels[i * 4 + 1] = FMath::Clamp(FMath::RoundToInt(RGB[i].G * 255.f), 0, 255);
-        Pixels[i * 4 + 2] = FMath::Clamp(FMath::RoundToInt(RGB[i].B * 255.f), 0, 255);
+        Pixels[i * 4 + 2] = FMath::Clamp(FMath::RoundToInt(RGB[i].R * 255.f), 0, 255);
         Pixels[i * 4 + 3] = 255;
     }
     Mip.BulkData.Unlock();

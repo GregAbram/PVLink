@@ -47,10 +47,16 @@ private:
     UPROPERTY()
     UMaterialInstanceDynamic* ActiveMID = nullptr;
 
-    // Cached geometry — needed to re-submit when vertex colours change
+    // Cached geometry — needed to re-submit when vertex colours change.
+    // Two-sided rendering is done by duplicating geometry with reversed
+    // winding + flipped normals (see UpdateMesh), not by a two-sided material
+    // shader trick -- so CachedVertices/CachedNormals are 2x NumOriginalVertices;
+    // vertex j and vertex (j + NumOriginalVertices) are the same source point,
+    // front and back copies.
     TArray<FVector> CachedVertices;
     TArray<int32>   CachedTriangles;
-    TArray<FVector> CachedNormals;    // empty if auto-computed
+    TArray<FVector> CachedNormals;    // never empty -- always computed, see UpdateMesh
+    int32            NumOriginalVertices = 0;
 
     // Per-variable scalar storage (raw, un-normalised)
     TMap<FString, TArray<float>> ScalarArrays;
