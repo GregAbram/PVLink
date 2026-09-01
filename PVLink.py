@@ -62,7 +62,7 @@ Wire format (little-endian)
     float64              current pipeline time (UPDATE_TIME_STEP)
 """
 
-PVLINK_VERSION = "1.21"
+PVLINK_VERSION = "1.22"
 
 import socket
 import struct
@@ -389,6 +389,8 @@ class PVLinkConnectionManager:
         self._sender  = _DirectSender()
         self._watcher = _ColormapWatcher(self._sender)
         self._sender.start()
+        self._pending_flip             = False   # set by mark_mesh_sent, consumed by the render observer
+        self._render_observer_installed = False
 
     # --- address management --------------------------------------------------
 
@@ -437,30 +439,88 @@ class PVLinkConnectionManager:
         self._sender.send_update()
 
     def mark_mesh_sent(self):
-        """Called right after a mesh has been (re)sent — sends UPDATE and blocks
-        for the ack immediately, on the calling thread.
+        """Called right after a mesh has been (re)sent.  Marks a flip as
+        pending; a one-time view EndEvent observer (see
+        _ensure_render_observer) sends a single UPDATE covering every mesh
+        sent since the last render, so multiple MeshSenders in one real
+        pipeline cycle flip together instead of each triggering its own
+        separate UPDATE/ack round trip.
 
-        Previously this coalesced sends via a 50ms debounce timer (and a
-        render-window StartEvent observer as a second trigger), so that
-        multiple MeshSenders in one pipeline cycle would flip Unity's buffers
-        together in a single UPDATE.  Under the Animation Scene's Play(),
-        RequestData for successive frames can run faster than the 50ms
-        window, so the timer kept getting cancelled and rescheduled and no
-        UPDATE was ever sent — Unity silently fell further and further behind
-        with no error, since mesh/colormap sends themselves always succeeded.
-        Sending synchronously here means RequestData — which runs on
-        whatever thread is driving the pipeline, including the animation
-        player — cannot return until Unity has actually swapped this mesh
-        in, so ParaView naturally paces itself to what Unity can keep up
-        with instead of racing ahead. The cost is one ack round-trip per
-        mesh sender instead of one per frame, and meshes from the same frame
-        may flip a beat apart rather than atomically — an acceptable trade
-        for never silently dropping frames.
+        History of this method (see git log for the full story):
+        - Originally: a 50ms debounce timer, so multiple MeshSenders in one
+          cycle would coalesce into a single UPDATE.  Under the Animation
+          Scene's Play(), RequestData for successive frames ran faster than
+          the 50ms window, so the timer kept getting cancelled and
+          rescheduled and no UPDATE was EVER sent — Unity silently fell
+          further and further behind with no error, since mesh/colormap
+          sends themselves always succeeded.
+        - Then: send UPDATE synchronously here, immediately, blocking the
+          calling thread for Unity's ack.  This fixed the starvation (no
+          timer to starve), but meant every MeshSender got its own separate
+          UPDATE/ack round trip, so meshes from the same real frame could
+          land on different UE frames instead of flipping together.
+        - Now: a view 'EndEvent' observer (fires once a real render actually
+          completes — reliable regardless of whether the animation is
+          driven by dataset timesteps or by keyframes on a downstream
+          filter's properties directly, e.g. Contour1's ContourValues,
+          where PVLinkDomainBoundsFilter itself never re-executes; see
+          Recorder's docstring in datamanager.py) is what actually sends
+          the UPDATE, once, covering everything sent since the last render.
+          Unlike the debounce timer, EndEvent isn't reset/cancelled by
+          successive RequestData calls, so it can't be starved the same way.
+          Backpressure is preserved: the observer's UPDATE send still
+          blocks (inside the render call) until Unity acks.
+
+        Falls back to sending UPDATE immediately here, per-mesh, if no view
+        is available to observe (e.g. a remote pvserver with no active
+        view) — better to flip per-mesh than to never flip at all.
         """
+        self._ensure_render_observer()
+        if self._render_observer_installed:
+            self._pending_flip = True
+            return
         try:
             self._sender.send_update()
         except Exception as exc:
             print(f"PVLink: mark_mesh_sent — UPDATE failed — {exc}", flush=True)
+
+    def _ensure_render_observer(self):
+        """Install a one-time view EndEvent observer that flips Unity's
+        buffers once per real render, covering every mesh sent since the
+        last one.  Idempotent — safe to call from every mark_mesh_sent()."""
+        if self._render_observer_installed:
+            return
+        # Mark installed BEFORE the pvs calls below, matching the
+        # re-entrancy-safe pattern used by _ensure_visibility_observer: any
+        # re-entrant RequestData triggered by these pvs calls hits this
+        # guard and returns immediately instead of recursing.
+        self._render_observer_installed = True
+        try:
+            import paraview.simple as pvs
+            view = pvs.GetActiveView()
+            if view is None:
+                # GetActiveView() returns None on remote pvserver (TACC).
+                views = pvs.GetViews()
+                view = views[0] if views else None
+            if view is None:
+                print("PVLink: no view found — falling back to per-mesh synchronous UPDATE", flush=True)
+                self._render_observer_installed = False
+                return
+
+            def _on_render_end(caller, event):
+                if not self._pending_flip:
+                    return
+                self._pending_flip = False
+                try:
+                    self._sender.send_update()
+                except Exception as exc:
+                    print(f"PVLink: render-observer UPDATE failed — {exc}", flush=True)
+
+            view.AddObserver('EndEvent', _on_render_end, 1.0)
+            print("PVLink: installed render EndEvent observer for synchronized multi-mesh flips", flush=True)
+        except Exception as exc:
+            print(f"PVLink: failed to install render observer — {exc}", flush=True)
+            self._render_observer_installed = False
 
     def watch_colormap(self, var_name, lut=None):
         self._watcher.watch(var_name, lut=lut)
