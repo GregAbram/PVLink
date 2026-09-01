@@ -1,0 +1,43 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
+            "name": "DataManager: Replay Sphere",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/datamanager.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["--client-port", "9010", "--cache-dir", "./recordings", "--project", "Sphere"]
+        },
+        {
+            "name": "DataManager: Replay Default",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/datamanager.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["--client-port", "9010", "--cache-dir", "./recordings", "--project", "Default"]
+        },
+        {
+            "name": "DataManager: Live",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/datamanager.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["--listen-port", "9000", "--client-port", "9010", "--cache-dir", "./recordings"]
+        }
+    ]
+}
