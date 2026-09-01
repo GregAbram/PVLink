@@ -245,7 +245,7 @@ class _DirectSender:
         self._conn       = _Connection()
         self._state      = {}          # key -> (msg_type, payload)
         self._host       = "127.0.0.1"
-        self._port       = 9001
+        self._port       = 9000   # DataManager's --listen-port default
 
     def start(self):  pass   # no-op; kept for API compatibility
 
@@ -427,7 +427,7 @@ class PVLinkConnectionManager:
 
     def __init__(self):
         self._host    = "127.0.0.1"
-        self._port    = 9001
+        self._port    = 9000   # DataManager's --listen-port default
         self._sender  = _DirectSender()
         self._watcher = _ColormapWatcher(self._sender)
         self._sender.start()
@@ -642,7 +642,7 @@ def get_pvlink_manager():
 
         from PVLink import get_pvlink_manager
         mgr = get_pvlink_manager()
-        mgr.connect('192.168.1.10', 9001)
+        mgr.connect('192.168.1.10', 9000)   # DataManager's --listen-port
         mgr.send_message(MSG_TYPE_UPDATE, b'')
     """
     global _fallback_manager
@@ -1172,7 +1172,7 @@ class PVLinkDomainBoundsFilter(VTKPythonAlgorithmBase):
     def __init__(self):
         super().__init__(nInputPorts=1, nOutputPorts=1)
         self._host        = "127.0.0.1"
-        self._port        = 9001
+        self._port        = 9000   # DataManager's --listen-port default
         self._override    = False
         self._xmin = 0.0; self._xmax = 1.0
         self._ymin = 0.0; self._ymax = 1.0
@@ -1202,7 +1202,7 @@ class PVLinkDomainBoundsFilter(VTKPythonAlgorithmBase):
     def GetHost(self):
         return self._host
 
-    @smproperty.intvector(name="TCPPort", default_values=9001)
+    @smproperty.intvector(name="TCPPort", default_values=9000)
     def SetTCPPort(self, val):
         self._port = int(val)
         get_pvlink_manager().set_address(self._host, self._port)

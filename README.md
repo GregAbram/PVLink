@@ -53,13 +53,39 @@ the LAN — see "Discovery" below.
 ## Quickstart
 
 **1. Load the ParaView plugin.** Tools → Manage Plugins → Load New… → select
-`PVLink.py`, tick Auto Load. Build a pipeline with a `PVLinkDomainBoundsFilter`
-upstream of one or more `PVLinkMeshSenderFilter`s (Filters → PVLink).
-Reminder: this plugin binds to ParaView's proxy manager at *load* time — after
-editing `PVLink.py`, you need a fresh plugin load or a ParaView restart, not
-just re-running something.
+`PVLink.py`, tick Auto Load. Reminder: this plugin binds to ParaView's proxy
+manager at *load* time — after editing `PVLink.py`, you need a fresh plugin
+load or a ParaView restart, not just re-running something.
 
-**2. Start the DataManager**, either live (waits for ParaView) or replaying a
+**2. Add the PVLink filters to your pipeline:**
+  1. Load or open whatever data you want to stream, and hit Apply so it's a
+     real source in the Pipeline Browser (a `Wavelet` source is a quick way
+     to try this without real data).
+  2. With that source selected, **Filters → PVLink → PVLink Domain Bounds**.
+     In the Properties panel, set **Host**/**TCPPort** to match your
+     DataManager (defaults `127.0.0.1`/`9000`, matching its `--listen-port`
+     default) and **ProjectName** if you want this stream recorded/replayed
+     under a specific name later. Apply. Place exactly one of these per
+     pipeline — it's what owns the connection and sends `BOUNDS`/`TIME`/
+     `PROJECT`.
+  3. With that filter (or anything downstream of it) selected, **Filters →
+     PVLink → PVLink Mesh Sender**. Set **MeshName** (the actor/object name
+     it'll appear as on the receiver side — use a different name per mesh
+     sender if you're streaming more than one), and **ColorArrayName**
+     (leave blank to auto-detect whatever's actively coloring it in
+     ParaView). Apply.
+  4. Repeat step 3 for any other filter output you want to stream in the
+     same pipeline (e.g. a `Contour` and a `Slice` off the same source) —
+     each just needs to be downstream of the *same* PVLink Domain Bounds
+     filter, which it'll find automatically and inherit the Host/TCPPort
+     from, so you only ever configure the connection once per pipeline.
+  5. From here it's automatic: every pipeline update (Apply, an animation
+     `Play()`, a parameter change) sends fresh data through. Multiple mesh
+     senders updating in the same real pipeline cycle flip together on the
+     receiver side rather than landing on separate frames (see
+     Backpressure below).
+
+**3. Start the DataManager**, either live (waits for ParaView) or replaying a
 previous recording (no ParaView needed):
 
 ```bash
@@ -72,7 +98,7 @@ python DataManager/datamanager.py --client-port 9010 \
                                    --cache-dir ./recordings --project Sphere
 ```
 
-**3. Open a client.** Either demo project's receiver dials the DataManager
+**4. Open a client.** Either demo project's receiver dials the DataManager
 using `DataManagerHost`/`DataManagerPort` (Unreal: `DefaultGame.ini`'s
 `[/Script/ParaViewLink.SocketReceiverSubsystem]` section; Unity: the
 `MeshReceiver` component's Inspector fields). Leave the host empty to use
