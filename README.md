@@ -78,6 +78,68 @@ using `DataManagerHost`/`DataManagerPort` (Unreal: `DefaultGame.ini`'s
 `MeshReceiver` component's Inspector fields). Leave the host empty to use
 auto-discovery instead (see below). Enter Play/PIE.
 
+## Incorporating into your own UE/Unreal or Unity project
+
+The steps below add the receiver to a project other than `Demos/Unreal`/
+`Demos/Unity` — e.g. an existing app you want to bring live ParaView data
+into. Nothing here needs the `Demos/` projects at all.
+
+### Unreal
+
+1. In your `.uproject`, add (or extend) `AdditionalPluginDirectories` with a
+   path to the **directory that contains** `ParaViewLinkUnreal/` (not the
+   plugin folder itself) — e.g. if this repo sits next to your project,
+   `"../PVLink"`. Then enable the plugin:
+   ```json
+   "AdditionalPluginDirectories": ["<path-containing-ParaViewLinkUnreal>"],
+   "Plugins": [{ "Name": "ParaViewLink", "Enabled": true }]
+   ```
+2. Rebuild (or open the Editor, which will offer to build it).
+3. Drag a **Sim Container** actor (`ASimContainerActor`) into your level and
+   size its box to cover the region you want ParaView data to appear in —
+   it's found automatically via a `SimContainer` tag it sets on itself, and
+   the coordinate transform (ParaView bounds → UE world space) is computed
+   from it the first time a `BOUNDS` message arrives. Multiple instances are
+   allowed; the first one found is used.
+4. That's it for a minimal setup. `UMeshReceiverSubsystem` is a
+   `GameInstanceSubsystem` — it's created automatically, dials the
+   DataManager on its own (or auto-discovers it if `DataManagerHost` is
+   left empty), and generates its own scalar-field material
+   (`M_ScalarField`) the first time it's needed, saving it into
+   `ParaViewLinkUnreal/Content/` so it persists across sessions. No manual
+   material assignment or Blueprint subclassing required.
+5. Optional: set `DataManagerHost`/`DataManagerPort`/`DiscoveryPort` in your
+   project's `Config/DefaultGame.ini` under
+   `[/Script/ParaViewLink.SocketReceiverSubsystem]` (see the Ports table
+   below for defaults) if you don't want auto-discovery.
+
+### Unity
+
+1. Add a local file reference to the package in your project's
+   `Packages/manifest.json` dependencies, pointing at wherever this repo's
+   `ParaViewLinkUnity/` folder lives relative to your project:
+   ```json
+   "com.paraviewlink.unity": "file:../relative/path/to/ParaViewLinkUnity"
+   ```
+   (`Demos/Unity` itself uses `file:../../../ParaViewLinkUnity` — adjust for
+   your project's location relative to this repo.)
+2. Add a `MeshReceiver` component (Add Component → ParaViewLink → Mesh
+   Receiver) to a GameObject in your scene. Assign `BaseScalarMaterial` —
+   unlike Unreal, Unity doesn't generate this automatically (leaving it
+   unset falls back to a plain `Unlit/Texture` placeholder, with a console
+   warning); use `ParaViewLinkUnity/Materials/M_ScalarField.mat` or
+   `M_ScalarFieldLit.mat`, or your own material using the same `_Colormap`
+   texture parameter convention.
+3. Add a `SimContainerObject` component to that **same** GameObject (it's
+   read via `GetComponent`, not found elsewhere in the scene) — ideally a
+   Cube, since its Transform (position/rotation/scale) *is* the container:
+   position = world-space center, scale = world-space extents. This is
+   Unity's equivalent of Unreal's Sim Container actor, read by
+   `MeshReceiver.ComputeCoordTransform()`.
+4. Leave `DataManagerHost` empty for auto-discovery, or set
+   `DataManagerHost`/`DataManagerPort`/`DiscoveryPort` directly on the
+   component in the Inspector.
+
 ## Ports
 
 | Port | Direction | Purpose |
