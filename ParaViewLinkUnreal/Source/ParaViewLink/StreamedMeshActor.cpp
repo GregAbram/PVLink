@@ -100,7 +100,7 @@ void AStreamedMeshActor::StoreScalars(const FString& VarName,
                                        const TArray<float>& Scalars)
 {
     ScalarArrays.Add(VarName, Scalars);
-    UE_LOG(LogTemp, Log, TEXT("StreamedMeshActor '%s': stored %d scalars for '%s'"),
+    UE_LOG(LogTemp, Verbose, TEXT("StreamedMeshActor '%s': stored %d scalars for '%s'"),
         *GetActorLabel(), Scalars.Num(), *VarName);
 }
 
@@ -127,7 +127,7 @@ void AStreamedMeshActor::SetActiveVariable(const FString& VarName,
     if (MID)
         MeshComponent->SetMaterial(0, MID);
 
-    UE_LOG(LogTemp, Log,
+    UE_LOG(LogTemp, Verbose,
         TEXT("StreamedMeshActor '%s': active variable '%s' [%.4g, %.4g]"),
         *GetActorLabel(), *VarName, ScalarMin, ScalarMax);
 }

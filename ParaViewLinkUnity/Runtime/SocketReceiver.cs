@@ -37,11 +37,20 @@ namespace ParaViewLink
         public bool IsConnecting => _running && !IsConnected;
         public bool IsConnected  => _client != null && _client.Connected;
 
+        /// <summary>Log every connect attempt and message header/ack.  Off by
+        /// default -- set by MeshReceiver from its own VerboseLogging field.</summary>
+        public bool VerboseLogging { get; set; }
+
         /// <summary>
         /// Invoked on the IO thread for every received message.
         /// The ack is sent to the DataManager as soon as this delegate returns.
         /// </summary>
         public Action<int, byte[]> OnMessage { get; set; }
+
+        private void Log(string message)
+        {
+            if (VerboseLogging) Debug.Log(message);
+        }
 
         // ---------------------------------------------------------------
         // Internal state
@@ -92,7 +101,7 @@ namespace ParaViewLink
                 var client = new TcpClient();
                 try
                 {
-                    Debug.Log($"[ParaViewLink] ConnectLoop: connecting to {_host}:{_port} ...");
+                    Log($"[ParaViewLink] ConnectLoop: connecting to {_host}:{_port} ...");
                     client.Connect(_host, _port);
                     client.NoDelay        = true;
                     client.ReceiveTimeout = 0;
@@ -136,7 +145,7 @@ namespace ParaViewLink
             {
                 while (_running && client.Connected)
                 {
-                    Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: waiting for next message header...");
+                    Log($"[ParaViewLink] ReadLoop [{ep}]: waiting for next message header...");
                     if (!ReadExact(stream, hdr, 8))
                     {
                         Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: header read returned 0 bytes — DataManager closed connection");
@@ -145,7 +154,7 @@ namespace ParaViewLink
 
                     int payloadLen = BitConverter.ToInt32(hdr, 0);
                     int msgType    = BitConverter.ToInt32(hdr, 4);
-                    Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: got header cmd={msgType} payloadLen={payloadLen}");
+                    Log($"[ParaViewLink] ReadLoop [{ep}]: got header cmd={msgType} payloadLen={payloadLen}");
 
                     if (payloadLen < 0 || payloadLen > 256 * 1024 * 1024)
                     {
@@ -174,10 +183,10 @@ namespace ParaViewLink
 
                     if (msgType == 2)   // MSG_TYPE_UPDATE only
                     {
-                        Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: sending UPDATE ack");
+                        Log($"[ParaViewLink] ReadLoop [{ep}]: sending UPDATE ack");
                         stream.Write(BitConverter.GetBytes(0), 0, 4);
                         stream.Flush();
-                        Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: UPDATE ack sent");
+                        Log($"[ParaViewLink] ReadLoop [{ep}]: UPDATE ack sent");
                     }
                 }
             }

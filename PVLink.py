@@ -64,11 +64,26 @@ Wire format (little-endian)
 
 PVLINK_VERSION = "1.22"
 
+import os
 import socket
 import struct
 import threading
 import time
 import numpy as np
+
+# Chatty per-message logging (one line per mesh/colormap/bounds/UPDATE send,
+# which under animation playback is many lines per second) is off by
+# default. Enable with the PVLINK_VERBOSE=1 environment variable, or live
+# from the ParaView Python shell: import PVLink; PVLink.PVLINK_VERBOSE = True
+# (no plugin reload needed -- _log() re-checks the flag on every call).
+# State-change prints (connect/disconnect, errors, one-time setup) are NOT
+# gated by this -- they're low-frequency and worth always seeing.
+PVLINK_VERBOSE = os.environ.get('PVLINK_VERBOSE', '') not in ('', '0', 'false', 'False')
+
+
+def _log(msg):
+    if PVLINK_VERBOSE:
+        print(msg, flush=True)
 
 import vtk
 from vtkmodules.util.numpy_support import vtk_to_numpy
@@ -123,21 +138,21 @@ class _Connection:
         data = struct.pack('<ii', len(payload), msg_type) + payload
         total = len(data)
         sent  = 0
-        print(f"PVLink: send_raw type={msg_type} len={len(payload)} total={total} ...", flush=True)
+        _log(f"PVLink: send_raw type={msg_type} len={len(payload)} total={total} ...")
         while sent < total:
             chunk = data[sent:sent + self._CHUNK]
             n = self._sock.send(chunk)
             sent += n
             if total > self._CHUNK:
-                print(f"PVLink: send_raw type={msg_type} {sent}/{total} bytes sent", flush=True)
-        print(f"PVLink: send_raw type={msg_type} done", flush=True)
+                _log(f"PVLink: send_raw type={msg_type} {sent}/{total} bytes sent")
+        _log(f"PVLink: send_raw type={msg_type} done")
 
         if msg_type != MSG_TYPE_UPDATE:
             return   # no ack expected for non-UPDATE messages
 
         # Wait for UPDATE ack with a timer-based timeout (select/settimeout
         # are unreliable inside ParaView's Python environment).
-        print(f"PVLink: send_raw UPDATE — waiting for ack ...", flush=True)
+        _log(f"PVLink: send_raw UPDATE — waiting for ack ...")
         _sock = self._sock
         def _timeout():
             print(f"PVLink: UPDATE ack timeout ({self._ACK_TIMEOUT}s) — shutting down socket", flush=True)
@@ -153,7 +168,7 @@ class _Connection:
         finally:
             timer.cancel()
 
-        print(f"PVLink: UPDATE ack={ack!r}", flush=True)
+        _log(f"PVLink: UPDATE ack={ack!r}")
         if ack is None:
             raise OSError("connection closed before UPDATE ack")
         status = struct.unpack('<i', ack)[0]
@@ -230,15 +245,15 @@ class _DirectSender:
         try:
             self._conn.send_raw(msg_type, payload)
             if msg_type == MSG_TYPE_MESH:
-                print(f"PVLink: sent mesh len={len(payload)}", flush=True)
+                _log(f"PVLink: sent mesh len={len(payload)}")
             elif msg_type == MSG_TYPE_COLORMAP:
-                print(f"PVLink: sent colormap len={len(payload)}", flush=True)
+                _log(f"PVLink: sent colormap len={len(payload)}")
             elif msg_type == MSG_TYPE_BOUNDS:
-                print(f"PVLink: sent bounds len={len(payload)}", flush=True)
+                _log(f"PVLink: sent bounds len={len(payload)}")
             elif msg_type == MSG_TYPE_UPDATE:
-                print(f"PVLink: sent UPDATE — Unity ack received", flush=True)
+                _log(f"PVLink: sent UPDATE — Unity ack received")
             else:
-                print(f"PVLink: sent type={msg_type} len={len(payload)}", flush=True)
+                _log(f"PVLink: sent type={msg_type} len={len(payload)}")
         except OSError as exc:
             print(f"PVLink: send error type={msg_type}: {exc}", flush=True)
             self._conn.disconnect()
@@ -272,11 +287,11 @@ class _DirectSender:
     def _replay_state(self):
         if not self._state:
             return
-        print(f"PVLink: replay_state: {len(self._state)} item(s)", flush=True)
+        _log(f"PVLink: replay_state: {len(self._state)} item(s)")
         for key, (mt, pl) in list(self._state.items()):
             try:
                 self._conn.send_raw(mt, pl)
-                print(f"PVLink: replay_state: '{key}' sent OK", flush=True)
+                _log(f"PVLink: replay_state: '{key}' sent OK")
             except OSError as exc:
                 print(f"PVLink: replay_state: '{key}' failed — {exc}", flush=True)
                 self._conn.disconnect()
@@ -370,7 +385,7 @@ class _ColormapWatcher:
         self._last_payloads[var_name] = payload
         # Register as persistent state so reconnects replay it, then enqueue.
         self._sender.register_state(f'colormap:{var_name}', MSG_TYPE_COLORMAP, payload)
-        print(f"PVLink: enqueued colormap for '{var_name}'")
+        _log(f"PVLink: enqueued colormap for '{var_name}'")
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +882,7 @@ class PVLinkMeshSenderFilter(VTKPythonAlgorithmBase):
         return 1
 
     def RequestData(self, request, inInfo, outInfo):
-        print("Mesh Sender RequestData called");
+        _log("Mesh Sender RequestData called")
         inp = self.GetInputData(inInfo, 0, 0)
         if inp is None:
             return 1
@@ -945,9 +960,9 @@ class PVLinkMeshSenderFilter(VTKPythonAlgorithmBase):
         if mgr.send_message(MSG_TYPE_MESH, payload):
             loc = "point" if is_point_data else "cell"
             scalar_desc = f"scalar='{color_name}' ({loc})" if color_name else "no scalar"
-            print(f"PVLink:sent '{self._mesh_name}' — "
-                  f"{inp.GetNumberOfPoints()} pts, "
-                  f"{inp.GetNumberOfCells()} cells, {scalar_desc}")
+            _log(f"PVLink:sent '{self._mesh_name}' — "
+                 f"{inp.GetNumberOfPoints()} pts, "
+                 f"{inp.GetNumberOfCells()} cells, {scalar_desc}")
             mgr.mark_mesh_sent()   # blocks until Unity acks the flip
 
         return 1
@@ -1269,7 +1284,7 @@ class PVLinkDomainBoundsFilter(VTKPythonAlgorithmBase):
         return 1
 
     def RequestData(self, request, inInfo, outInfo):
-        print("Domain Bounds  RequestData called")
+        _log("Domain Bounds  RequestData called")
         inp = self.GetInputData(inInfo, 0, 0)
         if inp is None:
             return 1

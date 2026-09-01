@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -44,11 +45,18 @@ namespace ParaViewLink
         // ───────────────────────────────────────────────── Inspector ────
 
         [Header("Network")]
-        [Tooltip("Host to dial the DataManager on.")]
-        public string DataManagerHost = "127.0.0.1";
+        [Tooltip("Host to dial the DataManager on. Leave empty to auto-connect: " +
+                 "waits for the discovery list to settle and connects only if " +
+                 "exactly one DataManager was found on the LAN.")]
+        public string DataManagerHost = "";
 
         [Tooltip("Port to dial the DataManager on — must match its --client-port.")]
         public int DataManagerPort = 9010;
+
+        [Tooltip("UDP port to listen for DataManager broadcast announcements on — " +
+                 "must match its --discovery-port. See DiscoveredDataManagers/" +
+                 "ConnectToDataManager() to use this without hardcoding an address.")]
+        public int DiscoveryPort = 9011;
 
         [Header("Coordinates")]
         [Tooltip("Auto-compute transform from domain bounds + SimContainer transform.")]
@@ -58,6 +66,19 @@ namespace ParaViewLink
         [Tooltip("Base material using the ScalarField URP shader.  " +
                  "One runtime copy is made per variable.")]
         public Material BaseScalarMaterial;
+
+        [Header("Debug")]
+        [Tooltip("Log every mesh/colormap/bounds/update message received. " +
+                 "Off by default -- this is one line per message, which under " +
+                 "animation playback is many lines per second.")]
+        public bool VerboseLogging = false;
+
+        /// <summary>Gated by VerboseLogging.  Warnings/errors are never gated --
+        /// use Debug.LogWarning/LogError directly for those.</summary>
+        private void Log(string message)
+        {
+            if (VerboseLogging) Debug.Log(message);
+        }
 
         // ──────────────────────────────────────────── Runtime state ─────
 
@@ -161,7 +182,8 @@ namespace ParaViewLink
 
         // ───────────────────────────────────── Scene state (main thread) ─
 
-        private SocketReceiver _socket;
+        private SocketReceiver       _socket;
+        private DataManagerDiscovery _discovery;
 
     private readonly Dictionary<string, MeshBufferPair> _meshPairs = new Dictionary<string, MeshBufferPair>();
     private readonly Dictionary<string, Texture2D>      _colormaps = new Dictionary<string, Texture2D>();
@@ -177,11 +199,74 @@ namespace ParaViewLink
 
         // ───────────────────────────────────────── Unity lifecycle ───────
 
+        /// <summary>How long to wait for the discovery list to settle before
+        /// deciding whether to auto-connect (see OnEnable/AutoConnectAfterSettle).
+        /// The DataManager announces every 2s (DataManager/datamanager.py's
+        /// DISCOVERY_INTERVAL) -- this gives one full interval plus margin.</summary>
+        private const float AutoConnectSettleSeconds = 3f;
+
         private void OnEnable()
         {
-            _socket           = new SocketReceiver();
-            _socket.OnMessage = HandleNetworkMessage;
+            _discovery                = new DataManagerDiscovery();
+            _discovery.VerboseLogging = VerboseLogging;
+            _discovery.Start(DiscoveryPort);
+
+            if (string.IsNullOrEmpty(DataManagerHost))
+            {
+                Debug.Log($"[ParaViewLink] MeshReceiver: no DataManagerHost configured -- " +
+                          $"waiting {AutoConnectSettleSeconds}s for discovery to settle");
+                StartCoroutine(AutoConnectAfterSettle());
+            }
+            else
+            {
+                StartSocket();
+            }
+        }
+
+        private IEnumerator AutoConnectAfterSettle()
+        {
+            yield return new WaitForSeconds(AutoConnectSettleSeconds);
+            List<DiscoveredDataManager> found = _discovery.GetDiscovered();
+            if (found.Count == 1)
+            {
+                Debug.Log($"[ParaViewLink] MeshReceiver: auto-connecting to the single discovered " +
+                          $"DataManager {found[0].Host}:{found[0].ClientPort}");
+                DataManagerHost = found[0].Host;
+                DataManagerPort = found[0].ClientPort;
+                StartSocket();
+            }
+            else
+            {
+                Debug.LogWarning($"[ParaViewLink] MeshReceiver: {found.Count} DataManager(s) found -- " +
+                                  "not auto-connecting (need exactly 1). Call ConnectToDataManager() manually.");
+            }
+        }
+
+        private void StartSocket()
+        {
+            _socket                = new SocketReceiver();
+            _socket.OnMessage      = HandleNetworkMessage;
+            _socket.VerboseLogging = VerboseLogging;
             _socket.Start(DataManagerHost, DataManagerPort);
+        }
+
+        /// <summary>Snapshot of DataManagers currently visible via UDP discovery
+        /// broadcast. No UI reads this yet -- it's the underlying capability
+        /// for whatever picker/settings UI comes later.</summary>
+        public List<DiscoveredDataManager> DiscoveredDataManagers =>
+            _discovery?.GetDiscovered() ?? new List<DiscoveredDataManager>();
+
+        /// <summary>Re-point the live connection at a specific DataManager, e.g.
+        /// one chosen from DiscoveredDataManagers. Stops the current connection
+        /// and starts a fresh one -- same connect-with-retry logic, just
+        /// re-targeted. Does not persist; only lasts for this running instance.</summary>
+        public void ConnectToDataManager(string host, int port)
+        {
+            Debug.Log($"[ParaViewLink] MeshReceiver: switching DataManager to {host}:{port}");
+            DataManagerHost = host;
+            DataManagerPort = port;
+            _socket?.Stop();
+            StartSocket();
         }
 
         private void OnDisable()
@@ -190,6 +275,8 @@ namespace ParaViewLink
             try { _flipDone.Release(); } catch { }
             _socket?.Stop();
             _socket = null;
+            _discovery?.Stop();
+            _discovery = null;
 
             // Drain any unprocessed parsed meshes (managed memory — GC handles it).
             while (_meshQueue.TryDequeue(out _)) { }
@@ -224,7 +311,7 @@ namespace ParaViewLink
             // in ParaView are reflected immediately without waiting for a mesh resend.
             while (_colormapQueue.TryDequeue(out RawColormap cm))
             {
-                Debug.Log($"[ParaViewLink] Update(): applying colormap '{cm.VariableName}' from queue");
+                Log($"[ParaViewLink] Update(): applying colormap '{cm.VariableName}' from queue");
                 ApplyColormap(cm);
             }
 
@@ -250,7 +337,7 @@ namespace ParaViewLink
             switch (cmd)
             {
                 case MeshCmd.Ping:
-                    Debug.Log($"[ParaViewLink] Ping: " +
+                    Log($"[ParaViewLink] Ping: " +
                               $"{(payload.Length > 0 ? Encoding.UTF8.GetString(payload) : "(empty)")}");
                     break;
 
@@ -261,7 +348,7 @@ namespace ParaViewLink
                     // managed arrays.  No Unity Mesh API is called here.
                     // ApplyMesh() on the main thread creates the actual Mesh object.
                     var parsed = ParseMeshData(payload);
-                    Debug.Log($"[ParaViewLink] Parsed mesh '{parsed.MeshName}': " +
+                    Log($"[ParaViewLink] Parsed mesh '{parsed.MeshName}': " +
                               $"{parsed.Vertices.Length} verts  " +
                               $"bounds={parsed.MeshBounds}  var='{parsed.VariableName}'");
                     _meshQueue.Enqueue(parsed);
@@ -271,7 +358,7 @@ namespace ParaViewLink
                 case MeshCmd.Colormap:
                 {
                     var cm = ParseColormap(payload);
-                    Debug.Log($"[ParaViewLink] Colormap received: var='{cm.VariableName}' samples={cm.Samples.Length}");
+                    Log($"[ParaViewLink] Colormap received: var='{cm.VariableName}' samples={cm.Samples.Length}");
                     _colormapQueue.Enqueue(cm);
                     break;
                 }
@@ -279,7 +366,7 @@ namespace ParaViewLink
                 case MeshCmd.Bounds:
                 {
                     var b = ParseBounds(payload);
-                    Debug.Log($"[ParaViewLink] Bounds received: {b}");
+                    Log($"[ParaViewLink] Bounds received: {b}");
                     lock (_boundsLock)
                     {
                         _incomingBounds   = b;
@@ -291,16 +378,16 @@ namespace ParaViewLink
                 case MeshCmd.Visibility:
                 {
                     var v = ParseVisibility(payload);
-                    Debug.Log($"[ParaViewLink] Visibility received: '{v.MeshName}' → {v.Visible}");
+                    Log($"[ParaViewLink] Visibility received: '{v.MeshName}' → {v.Visible}");
                     _visibilityQueue.Enqueue(v);
                     break;
                 }
 
                 case MeshCmd.Update:
-                    Debug.Log($"[ParaViewLink] Update received — signalling main thread flip");
+                    Log($"[ParaViewLink] Update received — signalling main thread flip");
                     _flipSignal.Release();
                     _flipDone.Wait();
-                    Debug.Log($"[ParaViewLink] Update: flip complete, ack sent to ParaView");
+                    Log($"[ParaViewLink] Update: flip complete, ack sent to ParaView");
                     break;
             }
         }
@@ -488,7 +575,7 @@ namespace ParaViewLink
             {
                 _pvBounds   = first.MeshBounds;
                 _haveBounds = true;
-                Debug.Log($"[ParaViewLink] No BOUNDS message — fitting from mesh extents: {_pvBounds}");
+                Log($"[ParaViewLink] No BOUNDS message — fitting from mesh extents: {_pvBounds}");
                 ComputeCoordTransform();
             }
 
@@ -505,7 +592,7 @@ namespace ParaViewLink
                 ApplyMesh(rm);
                 meshCount++;
             }
-            Debug.Log($"[ParaViewLink] SwapBuffers: applied {meshCount} mesh(es). " +
+            Log($"[ParaViewLink] SwapBuffers: applied {meshCount} mesh(es). " +
                       $"Pairs: {_meshPairs.Count}  " +
                       $"coordScale: {_coordScale}  coordPos: {_coordPos}");
         }
@@ -564,13 +651,13 @@ namespace ParaViewLink
                 var mat = EnsureVarMaterial(pm.VariableName);
                 pair.Back.Renderer.sharedMaterial = mat;
                 pair.VariableName = pm.VariableName;
-                Debug.Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': set back-buffer material for var='{pm.VariableName}'" +
+                Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': set back-buffer material for var='{pm.VariableName}'" +
                           $"  mat={mat?.name ?? "NULL"}" +
                           $"  colormap tex={(mat != null ? mat.GetTexture("_Colormap")?.name ?? "NULL" : "N/A")}");
             }
             else
             {
-                Debug.Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': no VariableName — material unchanged");
+                Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': no VariableName — material unchanged");
             }
 
             pair.Back.Go.transform.SetPositionAndRotation(_coordPos, _coordRot);
@@ -642,23 +729,23 @@ namespace ParaViewLink
             bool anyUpdated = false;
             foreach (var pair in _meshPairs.Values)
             {
-                Debug.Log($"[ParaViewLink] ApplyColormap: checking pair '{pair.Front.Go.name}'" +
+                Log($"[ParaViewLink] ApplyColormap: checking pair '{pair.Front.Go.name}'" +
                           $"  pair.VariableName='{pair.VariableName}'  looking for='{cm.VariableName}'");
                 if (pair.VariableName == cm.VariableName)
                 {
                     pair.Front.Renderer.sharedMaterial = mat;
                     anyUpdated = true;
-                    Debug.Log($"[ParaViewLink] ApplyColormap: reassigned material on '{pair.Front.Go.name}'");
+                    Log($"[ParaViewLink] ApplyColormap: reassigned material on '{pair.Front.Go.name}'");
                 }
             }
             if (!anyUpdated)
-                Debug.Log($"[ParaViewLink] ApplyColormap '{cm.VariableName}': no live renderer matched (colormap cached, will apply at next mesh swap)");
+                Log($"[ParaViewLink] ApplyColormap '{cm.VariableName}': no live renderer matched (colormap cached, will apply at next mesh swap)");
         }
         else
         {
             Debug.LogWarning("[ParaViewLink] BaseScalarMaterial not set – cannot apply colormap for '" + cm.VariableName + "'.");
         }
-        Debug.Log($"[ParaViewLink] Colormap '{cm.VariableName}' [{cm.Min:G4}, {cm.Max:G4}]");
+        Log($"[ParaViewLink] Colormap '{cm.VariableName}' [{cm.Min:G4}, {cm.Max:G4}]");
         }
 
         private Material EnsureVarMaterial(string varName)
@@ -709,7 +796,7 @@ namespace ParaViewLink
             _coordPos   = container.WorldCenter - Vector3.Scale(_pvBounds.center, _coordScale);
             _coordRot   = container.transform.rotation;
 
-            Debug.Log($"[ParaViewLink] CoordTransform — " +
+            Log($"[ParaViewLink] CoordTransform — " +
                       $"pvSize:{pvSize} containerSize:{ws} scale:{_coordScale} pos:{_coordPos}");
 
             // Reposition any currently live objects immediately.

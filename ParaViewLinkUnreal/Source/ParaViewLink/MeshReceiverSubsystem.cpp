@@ -369,7 +369,7 @@ void UMeshReceiverSubsystem::Tick(float DeltaTime)
                 }
 
                 int32 Total = PendingMeshes.Num() + PendingPVData.Num();
-                UE_LOG(LogTemp, Warning,
+                UE_LOG(LogTemp, Verbose,
                     TEXT("MeshReceiver: Flip installed %d mesh(es)"), Total);
             }
             PendingMeshes.Empty();
@@ -401,7 +401,7 @@ void UMeshReceiverSubsystem::Tick(float DeltaTime)
             // from one ParaView pipeline execution become active atomically.
             const FString& Name = Cmd->MeshData.Name;
             PendingPVData.Add(Name, MoveTemp(*Cmd));
-            UE_LOG(LogTemp, Log, TEXT("MeshReceiver: PVMesh '%s' buffered"), *Name);
+            UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: PVMesh '%s' buffered"), *Name);
             break;
         }
 
@@ -422,7 +422,7 @@ void UMeshReceiverSubsystem::Tick(float DeltaTime)
             StoredPVBounds = Cmd->BoundsBox;
             FVector Min = StoredPVBounds.Min;
             FVector Max = StoredPVBounds.Max;
-            UE_LOG(LogTemp, Log,
+            UE_LOG(LogTemp, Verbose,
                 TEXT("MeshReceiver: Domain bounds received  "
                      "X[%.4g, %.4g]  Y[%.4g, %.4g]  Z[%.4g, %.4g]"),
                 Min.X, Max.X, Min.Y, Max.Y, Min.Z, Max.Z);
@@ -451,7 +451,7 @@ void UMeshReceiverSubsystem::InstallOrUpdate(UWorld* World,
     {
         (*Existing)->SetActorTransform(CoordTransform);
         (*Existing)->UpdateMesh(Data.Vertices, Data.Triangles, Data.Normals);
-        UE_LOG(LogTemp, Log, TEXT("MeshReceiver: Updated '%s'"), *Name);
+        UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: Updated '%s'"), *Name);
     }
     else
     {
@@ -528,7 +528,7 @@ void UMeshReceiverSubsystem::HandleColormapCmd(const FString& VarName,
             Actor->SetActiveVariable(VarName, MID, Min, Max);
     }
 
-    UE_LOG(LogTemp, Log, TEXT("MeshReceiver: Updated colormap '%s' [%.4g, %.4g] (%d samples)"),
+    UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: Updated colormap '%s' [%.4g, %.4g] (%d samples)"),
         *VarName, Min, Max, RGB.Num());
 }
 
@@ -663,7 +663,7 @@ void UMeshReceiverSubsystem::ComputeCoordTransform()
         if (IsValid(Actor))
             Actor->SetActorTransform(CoordTransform);
 
-    UE_LOG(LogTemp, Log,
+    UE_LOG(LogTemp, Verbose,
         TEXT("MeshReceiver: CoordTransform set — "
              "Scale=(%.3g, %.3g, %.3g)  Translate=(%.1f, %.1f, %.1f)"),
         Scale.X, Scale.Y, Scale.Z,

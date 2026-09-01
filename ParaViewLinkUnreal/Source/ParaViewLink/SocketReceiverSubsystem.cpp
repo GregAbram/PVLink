@@ -21,32 +21,48 @@ void USocketReceiverSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
 
-    FString DataManagerHost = TEXT("127.0.0.1");
+    FString DataManagerHost;   // empty = unconfigured -> auto-connect via discovery
     int32   DataManagerPort = 9010;
     int32   OutboundPort    = 9002;
+    int32   DiscoveryPort   = 9011;
     GConfig->GetString(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("DataManagerHost"), DataManagerHost, GGameIni);
     GConfig->GetInt(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("DataManagerPort"), DataManagerPort, GGameIni);
     GConfig->GetInt(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("OutboundPort"), OutboundPort, GGameIni);
-
-    Receiver = new FSocketReceiverRunnable(DataManagerHost, DataManagerPort);
-
-    // Bind the callback — captures 'this', cleared in Deinitialize before thread stops.
-    Receiver->OnMessageReceived = [this](int32 Cmd, TArray<uint8> Payload)
-    {
-        this->HandleRawMessage(Cmd, MoveTemp(Payload));
-    };
-
-    ReceiverThread = FRunnableThread::Create(Receiver, TEXT("SocketReceiverThread"));
+    GConfig->GetInt(TEXT("/Script/ParaViewLink.SocketReceiverSubsystem"), TEXT("DiscoveryPort"), DiscoveryPort, GGameIni);
 
     Sender       = new FSocketSenderRunnable(OutboundPort);
     SenderThread = FRunnableThread::Create(Sender, TEXT("SocketSenderThread"));
 
-    UE_LOG(LogTemp, Warning, TEXT("SocketReceiverSubsystem: DataManager=%s:%d  Outbound=%d"),
-           *DataManagerHost, DataManagerPort, OutboundPort);
+    Discovery       = new FDataManagerDiscovery(DiscoveryPort);
+    DiscoveryThread = FRunnableThread::Create(Discovery, TEXT("DataManagerDiscoveryThread"));
+
+    if (DataManagerHost.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("SocketReceiverSubsystem: no DataManagerHost configured -- waiting %.1fs for discovery to settle"),
+            AutoConnectSettleSeconds);
+        AutoConnectTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateUObject(this, &USocketReceiverSubsystem::TryAutoConnect),
+            AutoConnectSettleSeconds);
+    }
+    else
+    {
+        StartReceiver(DataManagerHost, DataManagerPort);
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("SocketReceiverSubsystem: DataManager=%s  Outbound=%d  Discovery=%d"),
+           DataManagerHost.IsEmpty() ? TEXT("(auto)") : *FString::Printf(TEXT("%s:%d"), *DataManagerHost, DataManagerPort),
+           OutboundPort, DiscoveryPort);
 }
 
 void USocketReceiverSubsystem::Deinitialize()
 {
+    if (AutoConnectTickerHandle.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(AutoConnectTickerHandle);
+        AutoConnectTickerHandle.Reset();
+    }
+
     // Clear callback FIRST so the network thread stops calling into this subsystem.
     if (Receiver) Receiver->OnMessageReceived = nullptr;
 
@@ -58,8 +74,59 @@ void USocketReceiverSubsystem::Deinitialize()
     if (SenderThread) { SenderThread->WaitForCompletion(); delete SenderThread; SenderThread = nullptr; }
     if (Sender)       { delete Sender; Sender = nullptr; }
 
+    if (Discovery) Discovery->Stop();
+    if (DiscoveryThread) { DiscoveryThread->WaitForCompletion(); delete DiscoveryThread; DiscoveryThread = nullptr; }
+    if (Discovery)       { delete Discovery; Discovery = nullptr; }
+
     UE_LOG(LogTemp, Warning, TEXT("SocketReceiverSubsystem: Stopped"));
     Super::Deinitialize();
+}
+
+void USocketReceiverSubsystem::StartReceiver(const FString& Host, int32 Port)
+{
+    if (Receiver) Receiver->OnMessageReceived = nullptr;
+    if (Receiver) Receiver->Stop();
+    if (ReceiverThread) { ReceiverThread->WaitForCompletion(); delete ReceiverThread; ReceiverThread = nullptr; }
+    if (Receiver)       { delete Receiver; Receiver = nullptr; }
+
+    Receiver = new FSocketReceiverRunnable(Host, Port);
+    Receiver->OnMessageReceived = [this](int32 Cmd, TArray<uint8> Payload)
+    {
+        this->HandleRawMessage(Cmd, MoveTemp(Payload));
+    };
+    ReceiverThread = FRunnableThread::Create(Receiver, TEXT("SocketReceiverThread"));
+}
+
+TArray<FDiscoveredDataManager> USocketReceiverSubsystem::GetDiscoveredDataManagers() const
+{
+    return Discovery ? Discovery->GetDiscovered() : TArray<FDiscoveredDataManager>();
+}
+
+void USocketReceiverSubsystem::ConnectToDataManager(const FString& Host, int32 Port)
+{
+    UE_LOG(LogTemp, Warning, TEXT("SocketReceiverSubsystem: switching DataManager to %s:%d"), *Host, Port);
+    StartReceiver(Host, Port);
+}
+
+bool USocketReceiverSubsystem::TryAutoConnect(float DeltaTime)
+{
+    TArray<FDiscoveredDataManager> Found = GetDiscoveredDataManagers();
+    if (Found.Num() == 1)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("SocketReceiverSubsystem: auto-connecting to the single discovered DataManager %s:%d"),
+            *Found[0].Host, Found[0].ClientPort);
+        StartReceiver(Found[0].Host, Found[0].ClientPort);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("SocketReceiverSubsystem: %d DataManager(s) found -- not auto-connecting (need exactly 1). ")
+            TEXT("Call ConnectToDataManager() manually."),
+            Found.Num());
+    }
+    AutoConnectTickerHandle.Reset();
+    return false;   // one-shot -- unregister
 }
 
 bool USocketReceiverSubsystem::SendMessage(int32 Type, const TArray<uint8>& Payload)

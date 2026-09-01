@@ -79,6 +79,17 @@ MSG_TYPE_TIME       = 14
 
 HEADER_SIZE = 8   # int32 payload_len + int32 msg_type
 
+# Off by default -- gates only the per-timestep replay "flipped" line, which
+# under a fast/no-delay replay loop would otherwise print once per frame.
+# Enable with --verbose. All other prints here are one-time/state-change
+# events (connect, disconnect, errors) and stay unconditional.
+VERBOSE = False
+
+
+def _log(msg):
+    if VERBOSE:
+        print(msg, flush=True)
+
 
 def recv_exact(sock, n):
     """Read exactly n bytes, or return None if the peer closed first."""
@@ -380,6 +391,40 @@ def client_accept_loop(client_listener, registry, latest_state):
         ).start()
 
 
+DISCOVERY_INTERVAL = 2.0   # seconds between broadcasts
+
+
+def announce_loop(client_port, discovery_port, latest_state):
+    """Broadcast this DataManager's presence (client_port + whatever project
+    it's currently serving) on the LAN every DISCOVERY_INTERVAL seconds, so
+    Unity/Unreal clients can discover it without a hardcoded address.
+
+    Plain text, not the existing binary TCP framing -- this is tiny,
+    infrequent, and benefits from being readable while debugging (e.g. with
+    `nc -ul <discovery-port>`), unlike the main wire protocol which is
+    high-frequency enough that a hand-rolled binary format earns its keep.
+
+    A listener identifies this DataManager by (this packet's source IP,
+    client_port) -- the source IP is directly visible to the receiver via
+    recvfrom(), so this never needs to know or report its own IP itself."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    print(f"[DataManager] announcing on UDP broadcast port {discovery_port} "
+          f"every {DISCOVERY_INTERVAL}s", flush=True)
+    while True:
+        project_name = ''
+        if latest_state.project_payload is not None:
+            project_name = _read_name(latest_state.project_payload)
+        payload = (f"PVLINK-DISCOVERY 1\n"
+                   f"client_port={client_port}\n"
+                   f"project={project_name}\n").encode('utf-8')
+        try:
+            sock.sendto(payload, ('255.255.255.255', discovery_port))
+        except OSError as exc:
+            print(f"[DataManager] announce_loop: broadcast failed -- {exc}", flush=True)
+        time.sleep(DISCOVERY_INTERVAL)
+
+
 def relay_source_connection(source_sock, source_addr, registry, latest_state, cache_root):
     """Relay one live ParaView source connection to every currently-live
     client, optionally recording every message to disk. Runs on its own
@@ -495,8 +540,8 @@ def replay_project(project_dir, project_name, registry, latest_state, delay, loo
             if elapsed < delay:
                 time.sleep(delay - elapsed)
 
-            print(f"[DataManager] replay: flipped {os.path.basename(tdir)} "
-                  f"({len(mesh_files)} mesh(es))", flush=True)
+            _log(f"[DataManager] replay: flipped {os.path.basename(tdir)} "
+                 f"({len(mesh_files)} mesh(es))")
 
         if not loop:
             print("[DataManager] replay: finished (not looping)", flush=True)
@@ -529,7 +574,16 @@ def main():
                              help='replay mode: loop the recording indefinitely (default)')
     loop_group.add_argument('--no-loop', dest='loop', action='store_false',
                              help='replay mode: play the recording once and stop')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                         help='print the per-timestep replay "flipped" line (off by default)')
+    parser.add_argument('--discovery-port', type=int, default=9011,
+                         help='UDP port to broadcast this DataManager\'s presence on (default: 9011)')
+    parser.add_argument('--no-discovery', dest='discovery', action='store_false', default=True,
+                         help='disable the UDP broadcast announcement')
     args = parser.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
 
     project_dir = None
     if args.project:
@@ -552,6 +606,13 @@ def main():
         args=(client_listener, registry, latest_state),
         daemon=True,
     ).start()
+
+    if args.discovery:
+        threading.Thread(
+            target=announce_loop,
+            args=(args.client_port, args.discovery_port, latest_state),
+            daemon=True,
+        ).start()
 
     if project_dir is not None:
         print(f"[DataManager] replay mode: '{args.project}' from {project_dir}, "
