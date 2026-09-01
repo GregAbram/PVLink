@@ -138,7 +138,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 828499e4ccba34f57b77975b1a05af6b, type: 3}
   m_Name: 
   m_EditorClassIdentifier: ParaViewLink.Runtime::ParaViewLink.MeshReceiver
-  ListenAddress: 0.0.0.0
-  ListenPort: 9001
+  DataManagerHost: 127.0.0.1
+  DataManagerPort: 9010
   AutoComputeTransform: 1
   BaseScalarMaterial: {fileID: 2100000, guid: 154963d48581f4dfc8470571698db77b, type: 2}

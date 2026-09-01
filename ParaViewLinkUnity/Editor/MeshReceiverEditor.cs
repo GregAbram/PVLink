@@ -17,14 +17,14 @@ namespace ParaViewLink.Editor
             EditorGUILayout.LabelField("Status", EditorStyles.boldLabel);
 
             GUI.enabled = false;
-            EditorGUILayout.Toggle("Listening",         receiver.IsListening);
-            EditorGUILayout.Toggle("Client Connected",  receiver.IsClientConnected);
+            EditorGUILayout.Toggle("Connecting",  receiver.IsConnecting);
+            EditorGUILayout.Toggle("Connected",   receiver.IsConnected);
             GUI.enabled = true;
 
             if (Application.isPlaying)
             {
                 EditorGUILayout.Space();
-                if (GUILayout.Button("Restart Listener"))
+                if (GUILayout.Button("Reconnect"))
                 {
                     receiver.enabled = false;
                     receiver.enabled = true;

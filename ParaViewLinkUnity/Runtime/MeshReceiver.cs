@@ -44,11 +44,11 @@ namespace ParaViewLink
         // ───────────────────────────────────────────────── Inspector ────
 
         [Header("Network")]
-        [Tooltip("IP address to listen on.  0.0.0.0 = all interfaces.")]
-        public string ListenAddress = "0.0.0.0";
+        [Tooltip("Host to dial the DataManager on.")]
+        public string DataManagerHost = "127.0.0.1";
 
-        [Tooltip("TCP port — must match the Port property in the ParaView filter.")]
-        public int ListenPort = 9001;
+        [Tooltip("Port to dial the DataManager on — must match its --client-port.")]
+        public int DataManagerPort = 9010;
 
         [Header("Coordinates")]
         [Tooltip("Auto-compute transform from domain bounds + SimContainer transform.")]
@@ -61,8 +61,8 @@ namespace ParaViewLink
 
         // ──────────────────────────────────────────── Runtime state ─────
 
-        [HideInInspector] public bool IsListening       => _socket?.IsListening      ?? false;
-        [HideInInspector] public bool IsClientConnected => _socket?.IsClientConnected ?? false;
+        [HideInInspector] public bool IsConnecting => _socket?.IsConnecting ?? false;
+        [HideInInspector] public bool IsConnected  => _socket?.IsConnected  ?? false;
 
         // ─────────────────────── Vertex layout (interleaved, 28 bytes) ──
 
@@ -181,7 +181,7 @@ namespace ParaViewLink
         {
             _socket           = new SocketReceiver();
             _socket.OnMessage = HandleNetworkMessage;
-            _socket.Start(ListenAddress, ListenPort);
+            _socket.Start(DataManagerHost, DataManagerPort);
         }
 
         private void OnDisable()

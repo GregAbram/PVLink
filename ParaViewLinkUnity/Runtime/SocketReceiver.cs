@@ -1,5 +1,4 @@
 using System;
-using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using UnityEngine;
@@ -7,17 +6,21 @@ using UnityEngine;
 namespace ParaViewLink
 {
     /// <summary>
-    /// Background-thread TCP server.  Accepts one client at a time, reads
-    /// length-prefixed messages, and invokes <see cref="OnMessage"/> on the IO
-    /// thread for each one.
+    /// Background-thread TCP client.  Dials out to the DataManager and reads
+    /// length-prefixed messages, invoking <see cref="OnMessage"/> on the IO
+    /// thread for each one.  If the connection can't be established, or
+    /// drops, this keeps retrying (about once a second) rather than giving
+    /// up -- the DataManager may not be up yet, or may restart independently
+    /// of this client.
     ///
     /// Ack flow (backpressure):
     ///   Only UPDATE (type 2) receives a 4-byte ack (0 = OK).  All other
-    ///   message types (BOUNDS, COLORMAP, MESH) are fire-and-forget — PVLink
-    ///   sends them without waiting, so the tunnel isn't stalled by per-message
-    ///   round trips.  The UPDATE ack is the single backpressure point: PVLink
-    ///   waits for it before starting the next pipeline cycle, and Unity sends
-    ///   it only after the main-thread buffer swap completes.
+    ///   message types (BOUNDS, COLORMAP, MESH) are fire-and-forget — the
+    ///   DataManager sends them without waiting, so the tunnel isn't stalled
+    ///   by per-message round trips. The UPDATE ack is the single
+    ///   backpressure point: the sender waits for it before starting the
+    ///   next pipeline cycle, and Unity sends it only after the main-thread
+    ///   buffer swap completes.
     ///
     /// Wire format (little-endian):
     ///   int32  payload_byte_count
@@ -27,103 +30,99 @@ namespace ParaViewLink
     /// </summary>
     public class SocketReceiver
     {
-        public const string Version = "1.2";
+        public const string Version = "2.0";
         // ---------------------------------------------------------------
         // Public state
         // ---------------------------------------------------------------
-        public bool IsListening       => _listener != null;
-        public bool IsClientConnected => _client   != null && _client.Connected;
+        public bool IsConnecting => _running && !IsConnected;
+        public bool IsConnected  => _client != null && _client.Connected;
 
         /// <summary>
         /// Invoked on the IO thread for every received message.
-        /// The ack is sent to ParaView as soon as this delegate returns.
+        /// The ack is sent to the DataManager as soon as this delegate returns.
         /// </summary>
         public Action<int, byte[]> OnMessage { get; set; }
 
         // ---------------------------------------------------------------
         // Internal state
         // ---------------------------------------------------------------
-        private TcpListener   _listener;
         private TcpClient     _client;
-        private Thread        _acceptThread;
-        private Thread        _readThread;
+        private Thread        _connectThread;
         private volatile bool _running;
+        private string        _host;
+        private int           _port;
 
         // ---------------------------------------------------------------
         // Start / Stop
         // ---------------------------------------------------------------
 
-        public void Start(string address, int port)
+        public void Start(string host, int port)
         {
             if (_running) Stop();
 
-            IPAddress ip = address == "0.0.0.0" || string.IsNullOrEmpty(address)
-                ? IPAddress.Any
-                : IPAddress.Parse(address);
-
-            _listener = new TcpListener(ip, port);
-            _listener.Start();
+            _host    = host;
+            _port    = port;
             _running = true;
 
-            _acceptThread = new Thread(AcceptLoop)
-                { IsBackground = true, Name = "PVLink-Accept" };
-            _acceptThread.Start();
+            _connectThread = new Thread(ConnectLoop)
+                { IsBackground = true, Name = "PVLink-Connect" };
+            _connectThread.Start();
 
-            Debug.Log($"[ParaViewLink] v{Version} Listening on {ip}:{port}");
+            Debug.Log($"[ParaViewLink] v{Version} dialing {host}:{port}");
         }
 
         public void Stop()
         {
             _running = false;
-            try { _listener?.Stop(); } catch { }
-            try { _client?.Close();  } catch { }
-            _listener = null;
-            _client   = null;
-            _acceptThread?.Join(500);
-            _readThread?.Join(500);
-            _acceptThread = null;
-            _readThread   = null;
+            try { _client?.Close(); } catch { }
+            _client = null;
+            _connectThread?.Join(500);
+            _connectThread = null;
             Debug.Log("[ParaViewLink] Stopped.");
         }
 
         // ---------------------------------------------------------------
-        // Background threads
+        // Background thread
         // ---------------------------------------------------------------
 
-        private void AcceptLoop()
+        private void ConnectLoop()
         {
             while (_running)
             {
+                var client = new TcpClient();
                 try
                 {
-                    Debug.Log("[ParaViewLink] AcceptLoop: waiting for connection...");
-                    TcpClient client = _listener.AcceptTcpClient();
+                    Debug.Log($"[ParaViewLink] ConnectLoop: connecting to {_host}:{_port} ...");
+                    client.Connect(_host, _port);
                     client.NoDelay        = true;
                     client.ReceiveTimeout = 0;
-                    Debug.Log($"[ParaViewLink] Client connected: {client.Client.RemoteEndPoint}");
+                    Debug.Log($"[ParaViewLink] Connected to DataManager: {client.Client.RemoteEndPoint}");
 
-                    // Start the new ReadLoop BEFORE closing the old client.
-                    // If we close first, the new thread might inherit a stomped
-                    // reference and GetStream() throws on a non-connected socket.
-                    var prevClient = _client;
-                    _client     = client;
-                    _readThread = new Thread(() => ReadLoop(client))
-                        { IsBackground = true, Name = "PVLink-Read" };
-                    _readThread.Start();
-
-                    if (prevClient != null)
-                    {
-                        Debug.Log("[ParaViewLink] AcceptLoop: closing previous client");
-                        try { prevClient.Close(); } catch { }
-                    }
+                    _client = client;
+                    ReadLoop(client);
                 }
-                catch (SocketException) when (!_running) { break; }
+                catch (SocketException ex)
+                {
+                    if (_running)
+                        Debug.LogWarning($"[ParaViewLink] Connect failed: {ex.Message}");
+                }
                 catch (Exception ex)
                 {
                     if (_running)
-                        Debug.LogWarning($"[ParaViewLink] Accept error: {ex.Message}");
-                    Thread.Sleep(500);
+                        Debug.LogWarning($"[ParaViewLink] ConnectLoop error: {ex.Message}");
                 }
+                finally
+                {
+                    try { client.Close(); } catch { }
+                    if (ReferenceEquals(_client, client)) _client = null;
+                }
+
+                if (!_running) break;
+
+                // Wait before retrying, in short steps so Stop() is observed
+                // promptly rather than after one long sleep.
+                for (int i = 0; i < 10 && _running; i++)
+                    Thread.Sleep(100);
             }
         }
 
@@ -140,7 +139,7 @@ namespace ParaViewLink
                     Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: waiting for next message header...");
                     if (!ReadExact(stream, hdr, 8))
                     {
-                        Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: header read returned 0 bytes — client closed connection");
+                        Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: header read returned 0 bytes — DataManager closed connection");
                         break;
                     }
 
@@ -150,22 +149,22 @@ namespace ParaViewLink
 
                     if (payloadLen < 0 || payloadLen > 256 * 1024 * 1024)
                     {
-                        Debug.LogWarning($"[ParaViewLink] Bad payload length {payloadLen}, dropping client.");
+                        Debug.LogWarning($"[ParaViewLink] Bad payload length {payloadLen}, dropping connection.");
                         break;
                     }
 
                     byte[] payload = new byte[payloadLen];
                     if (payloadLen > 0 && !ReadExact(stream, payload, payloadLen))
                     {
-                        Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: payload read failed — client closed mid-message");
+                        Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: payload read failed — connection closed mid-message");
                         break;
                     }
 
                     // Invoke handler.  Only UPDATE (msgType==2) sends a 4-byte ack
-                    // back to PVLink; all other types are fire-and-forget.
+                    // back to the DataManager; all other types are fire-and-forget.
                     // The UPDATE handler blocks until the main-thread buffer swap
                     // completes, so the ack is the backpressure signal that tells
-                    // PVLink the frame is live and the next cycle can begin.
+                    // the sender the frame is live and the next cycle can begin.
                     try { OnMessage?.Invoke(msgType, payload); }
                     catch (Exception ex)
                     {
@@ -189,9 +188,7 @@ namespace ParaViewLink
             }
             finally
             {
-                try { client.Close(); } catch { }
-                if (ReferenceEquals(_client, client)) _client = null;
-                Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: exited — client disconnected");
+                Debug.Log($"[ParaViewLink] ReadLoop [{ep}]: exited — connection to DataManager lost");
             }
         }
 
