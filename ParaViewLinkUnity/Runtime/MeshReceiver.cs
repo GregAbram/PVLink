@@ -14,6 +14,16 @@ namespace ParaViewLink
     /// Receives ParaView mesh/colormap/bounds data over TCP and presents it in
     /// the Unity scene with minimal main-thread cost.
     ///
+    /// Network
+    /// ───────
+    /// SocketReceiver dials OUT to a DataManager (DataManagerHost/Port) rather
+    /// than listening -- the DataManager is the one relaying/caching/replaying
+    /// ParaView traffic, see DataManager/datamanager.py. If DataManagerHost is
+    /// left empty, this waits for DataManagerDiscovery's UDP broadcast listener
+    /// to settle (~3s) and auto-connects only if exactly one DataManager was
+    /// found on the LAN; otherwise call ConnectToDataManager() explicitly (e.g.
+    /// from a future picker UI -- DiscoveredDataManagers lists what's out there).
+    ///
     /// Threading model
     /// ───────────────
     /// IO thread (SocketReceiver.OnMessage):
@@ -22,7 +32,9 @@ namespace ParaViewLink
     ///     thread, enqueues the result, returns immediately.
     ///   • For Colormap/Bounds/Visibility: parses into plain structs and enqueues.
     ///   • For Update (flip): releases _flipSignal then BLOCKS on _flipDone until
-    ///     the main thread confirms the swap.  No ack is sent (one-way protocol).
+    ///     the main thread confirms the swap, then sends a 4-byte ack back to
+    ///     the DataManager -- this ack is the backpressure point that paces
+    ///     ParaView to what Unity can keep up with.
     ///
     /// Main thread (Update):
     ///   • Applies immediate visibility changes from the visibility queue.

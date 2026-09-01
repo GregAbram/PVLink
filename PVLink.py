@@ -3,8 +3,12 @@ PVLink.py  —  ParaView plugin
 =====================================
 Sits in the ParaView pipeline as a transparent pass-through filter.
 On every pipeline update it triangulates the input mesh, detects the
-active color-mapping variable, and sends both to the PVLink receiver
-over a TCP socket.
+active color-mapping variable, and sends both to a PVLink DataManager
+over a TCP socket -- the DataManager relays to every connected Unity/
+Unreal client (see DataManager/datamanager.py), records to disk if
+asked, and can replay a recording later with no ParaView involved at
+all. This file talks only to the DataManager; it never connects to a
+Unity/Unreal client directly.
 
 Installation
 ------------
@@ -12,21 +16,30 @@ Installation
   Tick "Auto Load" to persist across sessions.
 
 The filter then appears under  Filters → PVLink → PVLink Mesh Sender.
+Note: this class is registered with ParaView's proxy manager at PLUGIN
+LOAD time, not at module-reload time -- editing this file and re-running
+it does NOT pick up changes on an already-loaded session. Reload the
+plugin (or restart ParaView) after any edit here.
 
 Global connection manager
 -------------------------
-The connection is managed by a session-global PVLinkConnectionManager
-stored on paraview.servermanager.  Any ParaView Python code can reach it:
+The connection (to the DataManager, not directly to a receiver) is
+managed by a session-global PVLinkConnectionManager stored on
+paraview.servermanager.  Any ParaView Python code can reach it:
 
     from PVLink import get_pvlink_manager
     mgr = get_pvlink_manager()
-    mgr.connect('192.168.1.10', 9001)   # optional explicit connect
+    mgr.connect('192.168.1.10', 9000)   # DataManager's --listen-port
 
 Wire format (little-endian)
 ----------------------------------------------------------------------
-  Outer envelope (no ack — one-way fire-and-forget):
+  Outer envelope (no ack for most types -- one-way fire-and-forget;
+  UPDATE is the exception, see below):
     int32   payload_byte_count
-    int32   message_type   (MSG_TYPE_MESH=10 | MSG_TYPE_COLORMAP=5 | MSG_TYPE_UPDATE=2)
+    int32   message_type
+      MSG_TYPE_UPDATE=2 | MSG_TYPE_COLORMAP=5 | MSG_TYPE_MESH=10 |
+      MSG_TYPE_BOUNDS=11 | MSG_TYPE_VISIBILITY=12 | MSG_TYPE_PROJECT=13 |
+      MSG_TYPE_TIME=14
 
   Mesh payload (MSG_TYPE_MESH):
     int32   num_points
@@ -53,6 +66,20 @@ Wire format (little-endian)
 
   Update payload (MSG_TYPE_UPDATE):
     (empty — 0 bytes)
+    The only message type that gets an ack: a 4-byte int32 status (0=OK)
+    comes back once the receiver(s) have applied everything sent since
+    the last UPDATE. This is the backpressure point -- see
+    PVLinkConnectionManager.mark_mesh_sent()'s docstring for why it's
+    driven by a view render-end observer rather than sent per mesh sender.
+
+  Bounds payload (MSG_TYPE_BOUNDS) -- deduped, only sent when changed:
+    float32[6]           [xmin, xmax, ymin, ymax, zmin, zmax]
+
+  Visibility payload (MSG_TYPE_VISIBILITY) -- sent when a mesh's eye
+  icon is toggled in the Pipeline Browser:
+    int32               name_len
+    utf8[name_len]      mesh/actor name
+    int32               visible (0 or 1)
 
   Project payload (MSG_TYPE_PROJECT) — sent once, replayed on reconnect:
     int32               name_len

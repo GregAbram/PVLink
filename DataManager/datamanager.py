@@ -28,6 +28,12 @@ Two mutually-exclusive run modes, chosen by whether --project is given:
   that, not the primary pacer, so a slow client is what sets the pace, not
   a blind guess.
 
+Discovery: this DataManager also broadcasts its own presence over UDP
+(--discovery-port, default 9011) every couple of seconds, in both run
+modes, so Unity/Unreal clients don't need a hardcoded address -- see
+announce_loop() below, and DataManagerDiscovery in ParaViewLinkUnreal/
+ParaViewLinkUnity for the listener side. --no-discovery disables it.
+
 On-disk cache layout (written by Recorder in live mode, read by replay
 mode) -- every file is the exact payload bytes already built for the
 socket, so recording is "write what I already have" and replay is "read it
@@ -58,6 +64,9 @@ Usage:
     # Replay: no ParaView needed, serve a previously-recorded project
     python datamanager.py --client-port 9010 \
                            --cache-dir ./recordings --project Sphere
+
+    # Add -v/--verbose for the per-timestep replay "flipped" line;
+    # add --no-discovery to disable the UDP presence broadcast.
 """
 
 import argparse
