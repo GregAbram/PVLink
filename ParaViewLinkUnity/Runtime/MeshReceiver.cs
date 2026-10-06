@@ -203,8 +203,10 @@ namespace ParaViewLink
 
     private Bounds     _pvBounds   = new Bounds();
     private bool       _haveBounds = false;
+    // Mesh transform *local to this GameObject* (the SimContainer): maps ParaView
+    // coordinates into the container's unit cube, so the container's own
+    // position/rotation/scale place the data and moving it later just works.
     private Vector3    _coordPos   = Vector3.zero;
-    private Quaternion _coordRot   = Quaternion.identity;
     private Vector3    _coordScale = Vector3.one;
     // Parent object that will hold all A/B buffer GameObjects.
     private GameObject _bufferParent;
@@ -672,8 +674,7 @@ namespace ParaViewLink
                 Log($"[ParaViewLink] ApplyMesh '{pm.MeshName}': no VariableName — material unchanged");
             }
 
-            pair.Back.Go.transform.SetPositionAndRotation(_coordPos, _coordRot);
-            pair.Back.Go.transform.localScale = _coordScale;
+            ApplyCoordTransform(pair.Back.Go.transform);
 
             pair.Swap();
         }
@@ -803,20 +804,32 @@ namespace ParaViewLink
                 Debug.LogWarning("[ParaViewLink] Degenerate PV bounds — skipping CoordTransform.");
                 return;
             }
-            Vector3 ws  = container.WorldSize;
-            _coordScale = new Vector3(ws.x / pvSize.x, ws.y / pvSize.y, ws.z / pvSize.z);
-            _coordPos   = container.WorldCenter - Vector3.Scale(_pvBounds.center, _coordScale);
-            _coordRot   = container.transform.rotation;
+            // Map the ParaView bounds onto the container's local unit cube
+            // (-0.5..0.5 per axis); the container Transform then supplies world
+            // centre, rotation and size. Previously this baked the container's
+            // world pose into each mesh at bounds time, which ignored rotation
+            // for the centre offset, applied the container's scale twice (the
+            // meshes are its children), and snapped new frames back to the old
+            // pose after the container moved - all invisible with an identity
+            // container, as in the desktop demo.
+            _coordScale = new Vector3(1f / pvSize.x, 1f / pvSize.y, 1f / pvSize.z);
+            _coordPos   = -Vector3.Scale(_pvBounds.center, _coordScale);
 
             Log($"[ParaViewLink] CoordTransform — " +
-                      $"pvSize:{pvSize} containerSize:{ws} scale:{_coordScale} pos:{_coordPos}");
+                      $"pvSize:{pvSize} containerSize:{container.WorldSize} localScale:{_coordScale} localPos:{_coordPos}");
 
-            // Reposition any currently live objects immediately.
             foreach (var pair in _meshPairs.Values)
             {
-                pair.Front.Go.transform.SetPositionAndRotation(_coordPos, _coordRot);
-                pair.Front.Go.transform.localScale = _coordScale;
+                ApplyCoordTransform(pair.Front.Go.transform);
+                ApplyCoordTransform(pair.Back.Go.transform);
             }
+        }
+
+        private void ApplyCoordTransform(Transform meshTransform)
+        {
+            meshTransform.localPosition = _coordPos;
+            meshTransform.localRotation = Quaternion.identity;
+            meshTransform.localScale    = _coordScale;
         }
 
         // ─────────────────────── IO-thread parsers (no Unity API) ────────
