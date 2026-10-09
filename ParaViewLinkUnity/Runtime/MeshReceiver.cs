@@ -239,20 +239,30 @@ namespace ParaViewLink
 
         private IEnumerator AutoConnectAfterSettle()
         {
+            // Keep looking until exactly one DataManager is announcing, so one
+            // started after the app is still found. Stops as soon as anything
+            // (this, or ConnectToDataManager) has started a connection.
             yield return new WaitForSeconds(AutoConnectSettleSeconds);
-            List<DiscoveredDataManager> found = _discovery.GetDiscovered();
-            if (found.Count == 1)
+            var lastCount = -1;
+            while (_socket == null && _discovery != null)
             {
-                Debug.Log($"[ParaViewLink] MeshReceiver: auto-connecting to the single discovered " +
-                          $"DataManager {found[0].Host}:{found[0].ClientPort}");
-                DataManagerHost = found[0].Host;
-                DataManagerPort = found[0].ClientPort;
-                StartSocket();
-            }
-            else
-            {
-                Debug.LogWarning($"[ParaViewLink] MeshReceiver: {found.Count} DataManager(s) found -- " +
-                                  "not auto-connecting (need exactly 1). Call ConnectToDataManager() manually.");
+                List<DiscoveredDataManager> found = _discovery.GetDiscovered();
+                if (found.Count == 1)
+                {
+                    Debug.Log($"[ParaViewLink] MeshReceiver: auto-connecting to the single discovered " +
+                              $"DataManager {found[0].Host}:{found[0].ClientPort}");
+                    DataManagerHost = found[0].Host;
+                    DataManagerPort = found[0].ClientPort;
+                    StartSocket();
+                    yield break;
+                }
+                if (found.Count != lastCount)
+                {
+                    lastCount = found.Count;
+                    Debug.LogWarning($"[ParaViewLink] MeshReceiver: {found.Count} DataManager(s) found -- " +
+                                     "not auto-connecting (need exactly 1); still looking. Call ConnectToDataManager() to choose.");
+                }
+                yield return new WaitForSeconds(AutoConnectSettleSeconds);
             }
         }
 
