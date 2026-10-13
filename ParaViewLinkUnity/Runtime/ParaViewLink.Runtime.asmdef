@@ -2,7 +2,8 @@
     "name": "ParaViewLink.Runtime",
     "rootNamespace": "ParaViewLink",
     "references": [
-        "Unity.InputSystem"
+        "Unity.InputSystem",
+        "DataManager.Runtime"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
