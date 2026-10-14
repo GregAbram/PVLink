@@ -43,7 +43,9 @@ enum dm_event_type {
     DM_EV_MANIFEST       = 7,   /* count, keys, hashes: the complete snapshot */
     DM_EV_ITEM           = 8,   /* key, hash, meta, data */
     DM_EV_BATCH_END      = 9,   /* batch_id: apply the batch, then dm_ack */
-    DM_EV_PROJECT_LIST   = 10   /* count, keys: project names */
+    DM_EV_PROJECT_LIST   = 10,  /* count, keys: project names */
+    DM_EV_PUT_STORED     = 11   /* batch_id: the request id from dm_put / dm_remove_untimed;
+                                   code: 0 stored (or unchanged), 1 refused; message: reason */
 };
 
 typedef struct dm_playback_state {
@@ -119,6 +121,13 @@ DM_API int dm_set_loop(dm_client* c, int loop);
 DM_API int dm_follow_live(dm_client* c, int follow);
 DM_API int dm_select_project(dm_client* c, const char* project);
 DM_API int dm_list_projects(dm_client* c);
+
+/* Untimed items (SPEC.md 5.8): writes the current version of `key` in the
+ * attached project, e.g. "State/abr" or "VisAsset/<uuid>". Returns a request
+ * id (> 0) matched by a later DM_EV_PUT_STORED event, or 0 if not connected. */
+DM_API uint64_t dm_put(dm_client* c, const char* key, const char* meta, uint32_t meta_length,
+                       const uint8_t* data, uint64_t data_length);
+DM_API uint64_t dm_remove_untimed(dm_client* c, const char* key);
 
 DM_API void dm_close(dm_client* c);
 
