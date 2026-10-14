@@ -511,24 +511,21 @@ void UMeshReceiverSubsystem::ApplyBatch(FDMBatch& B)
             LiveActors.Add(M.Name, Actor);
         }
         Actor->SetActorTransform(CoordTransform);
-        Actor->UpdateMesh(M.Vertices, M.Triangles, M.Normals);
-        if (!M.ColorBy.IsEmpty())
-        {
-            const FVector2f* R = ColormapRanges.Find(M.ColorBy);
-            const FVector2f Range = R ? *R : M.DataRange;
-            Actor->StoreScalars(M.ColorBy, M.ColorValues);
-            Actor->SetActiveVariable(M.ColorBy, EnsureVarMaterial(M.ColorBy, Colormaps.FindRef(M.ColorBy)),
-                                     Range.X, Range.Y > Range.X ? Range.Y : Range.X + 1.f);
-        }
-        else
+        // Scalars first: UpdateMesh re-applies the active variable to the new vertices.
+        const bool bSolid = M.ColorBy.IsEmpty();
+        const FString& Var = bSolid ? Solid : M.ColorBy;
+        if (bSolid)
         {
             if (!Colormaps.Contains(Solid))
                 Colormaps.Add(Solid, CreateOrUpdateColormapTexture(Solid, { SolidColor, SolidColor }));
-            TArray<float> Zeros;
-            Zeros.SetNumZeroed(M.Vertices.Num());
-            Actor->StoreScalars(Solid, Zeros);
-            Actor->SetActiveVariable(Solid, EnsureVarMaterial(Solid, Colormaps.FindRef(Solid)), 0.f, 1.f);
+            M.ColorValues.SetNumZeroed(M.Vertices.Num());
         }
+        Actor->StoreScalars(Var, M.ColorValues);
+        Actor->UpdateMesh(M.Vertices, M.Triangles, M.Normals);
+        const FVector2f* R = bSolid ? nullptr : ColormapRanges.Find(Var);
+        const FVector2f Range = bSolid ? FVector2f(0.f, 1.f) : R ? *R : M.DataRange;
+        Actor->SetActiveVariable(Var, EnsureVarMaterial(Var, Colormaps.FindRef(Var)),
+                                 Range.X, Range.Y > Range.X ? Range.Y : Range.X + 1.f);
     }
     ApplyVisibility();
     CurrentTime = B.Time;
