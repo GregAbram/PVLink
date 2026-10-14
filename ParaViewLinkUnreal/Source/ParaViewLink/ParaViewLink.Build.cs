@@ -1,3 +1,4 @@
+using System.IO;
 using UnrealBuildTool;
 
 public class ParaViewLink : ModuleRules
@@ -7,8 +8,6 @@ public class ParaViewLink : ModuleRules
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
         // All plugin source files sit directly in the module directory.
-        // Public/ and Private/ subdirectories are optional — if you prefer
-        // to keep headers and .cpp files together, leave this as-is.
         PublicIncludePaths.Add(ModuleDirectory);
 
         PublicDependencyModuleNames.AddRange(new string[]
@@ -16,13 +15,13 @@ public class ParaViewLink : ModuleRules
             "Core",
             "CoreUObject",
             "Engine",
-            "Sockets",
-            "Networking",
+            "Json",
             "ProceduralMeshComponent",
         });
 
         PrivateDependencyModuleNames.AddRange(new string[]
         {
+            "Projects",   // IPluginManager, to find the DataManager library
             "Slate",
             "SlateCore",
         });
@@ -35,6 +34,28 @@ public class ParaViewLink : ModuleRules
                 "UnrealEd",
                 "AssetRegistry",
             });
+        }
+
+        // DataManager client library (C API; see ThirdParty/DataManager/README.md).
+        string DM = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "ThirdParty", "DataManager"));
+        PublicIncludePaths.Add(Path.Combine(DM, "include"));
+        if (Target.Platform == UnrealTargetPlatform.Win64)
+        {
+            string Lib = Path.Combine(DM, "lib", "Win64");
+            PublicAdditionalLibraries.Add(Path.Combine(Lib, "dmcore.lib"));
+            PublicDelayLoadDLLs.Add("dmcore.dll");   // loaded explicitly in StartupModule
+            RuntimeDependencies.Add("$(BinaryOutputDir)/dmcore.dll", Path.Combine(Lib, "dmcore.dll"));
+        }
+        else if (Target.Platform == UnrealTargetPlatform.Mac)
+        {
+            string Dylib = Path.Combine(DM, "lib", "Mac", "libdmcore.dylib");
+            PublicAdditionalLibraries.Add(Dylib);
+            RuntimeDependencies.Add("$(BinaryOutputDir)/libdmcore.dylib", Dylib);
+        }
+        else if (Target.Platform == UnrealTargetPlatform.Android)
+        {
+            PublicAdditionalLibraries.Add(Path.Combine(DM, "lib", "Android", "arm64-v8a", "libdmcore.so"));
+            AdditionalPropertiesForReceipt.Add("AndroidPlugin", Path.Combine(ModuleDirectory, "ParaViewLink_APL.xml"));
         }
     }
 }

@@ -1,4 +1,13 @@
 #include "MeshReceiverSubsystem.h"
+#include "KeyDataGeometry.h"
+#include "Async/Async.h"
+#include "HAL/Runnable.h"
+#include "HAL/RunnableThread.h"
+#include "HAL/ThreadSafeBool.h"
+#include "Misc/Paths.h"
+#include "dm/dm.h"
+
+#include <atomic>
 #include "SimContainerActor.h"
 #include "StreamedMeshActor.h"
 #include "Components/BoxComponent.h"
@@ -112,6 +121,175 @@ static UMaterial* CreateScalarFieldMaterial()
 #endif // WITH_EDITOR
 
 // ---------------------------------------------------------------------------
+// Poll thread: receives events from the DataManager client, assembles batches
+// and builds their geometry, so the game thread only applies them.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    FString Utf8(const char* S) { return S ? FString(UTF8_TO_TCHAR(S)) : FString(); }
+}
+
+class FDMPollRunnable : public FRunnable
+{
+public:
+    FDMPollRunnable(dm_client* InClient, float InPointSize, float InLineWidth)
+        : Client(InClient), PointSize(InPointSize), LineWidth(InLineWidth) {}
+
+    TQueue<TUniquePtr<FDMBatch>, EQueueMode::Spsc> Batches;
+    TQueue<FString, EQueueMode::Spsc> Messages;     // log lines for the game thread
+    FThreadSafeBool bConnected = false;
+    FThreadSafeBool bStop = false;
+    FString Project;                                 // written before bConnected is set
+    std::atomic<bool> bHaveState { false };
+    FCriticalSection StateLock;
+    dm_playback_state State {};
+
+    virtual uint32 Run() override
+    {
+        while (!bStop)
+        {
+            dm_event Ev;
+            if (!dm_poll(Client, &Ev))
+            {
+                FPlatformProcess::Sleep(0.002f);
+                continue;
+            }
+            Handle(Ev);
+            dm_release(Client, &Ev);
+        }
+        return 0;
+    }
+    virtual void Stop() override { bStop = true; }
+
+private:
+    struct FRawItem
+    {
+        FString Key;
+        TArray<char> Meta;
+        TArray<uint8> Data;
+    };
+
+    dm_client* Client;
+    float PointSize, LineWidth;
+    TUniquePtr<FDMBatch> Building;
+    TArray<FRawItem> RawKeyData;
+    TSet<FString> LastManifest, Manifest;
+    FBox DomainPV = FBox(ForceInit);
+
+    void Handle(const dm_event& Ev)
+    {
+        switch (Ev.type)
+        {
+        case DM_EV_CONNECTED:
+            Project = Utf8(Ev.message);
+            bConnected = true;
+            Messages.Enqueue(FString::Printf(TEXT("connected to DataManager, project '%s'"), *Project));
+            break;
+        case DM_EV_DISCONNECTED:
+            bConnected = false;
+            Building.Reset();
+            RawKeyData.Reset();
+            Messages.Enqueue(FString::Printf(TEXT("DataManager connection lost (%s); reconnecting"), *Utf8(Ev.message)));
+            break;
+        case DM_EV_REJECTED:
+        case DM_EV_ERROR:
+            Messages.Enqueue(FString::Printf(TEXT("DataManager: %s"), *Utf8(Ev.message)));
+            break;
+        case DM_EV_PLAYBACK_STATE:
+        {
+            FScopeLock L(&StateLock);
+            State = Ev.state;
+            State.project = nullptr;   // not valid after release
+            bHaveState = true;
+            break;
+        }
+        case DM_EV_BATCH_BEGIN:
+            Building = MakeUnique<FDMBatch>();
+            Building->Id = Ev.batch_id;
+            Building->Time = Ev.time;
+            RawKeyData.Reset();
+            break;
+        case DM_EV_MANIFEST:
+            Manifest.Reset();
+            for (uint32 i = 0; i < Ev.count; ++i) Manifest.Add(Utf8(Ev.keys[i]));
+            break;
+        case DM_EV_ITEM:
+            if (Building) HandleItem(Ev);
+            break;
+        case DM_EV_BATCH_END:
+            if (Building && Building->Id == Ev.batch_id) FinishBatch();
+            break;
+        default:
+            break;
+        }
+    }
+
+    void HandleItem(const dm_event& Ev)
+    {
+        const FString Key = Utf8(Ev.key);
+        int32 Slash;
+        if (!Key.FindChar(TEXT('/'), Slash)) return;
+        const FString Type = Key.Left(Slash), Name = Key.Mid(Slash + 1);
+        if (Type == TEXT("KeyData"))
+        {
+            // Built at the end of the batch, once the domain size is known.
+            FRawItem& R = RawKeyData.AddDefaulted_GetRef();
+            R.Key = Key;
+            R.Meta.Append(Ev.meta, Ev.meta_length);
+            R.Data.Append(Ev.data, int64(Ev.data_length));
+        }
+        else if (Type == TEXT("Colormap"))
+        {
+            FDMColormap C;
+            if (PVLinkKeyData::ParseColormap(Ev.data, Ev.data_length, C)) Building->Colormaps.Add(MoveTemp(C));
+        }
+        else if (Type == TEXT("Bounds"))
+        {
+            FBox B;
+            if (PVLinkKeyData::ParseBounds(Ev.data, Ev.data_length, B))
+            {
+                DomainPV = B;
+                Building->Bounds = FBox(PVLinkKeyData::ToUnreal(B.Min.X, B.Max.Y, B.Min.Z),
+                                        PVLinkKeyData::ToUnreal(B.Max.X, B.Min.Y, B.Max.Z));
+            }
+        }
+        else if (Type == TEXT("Visibility"))
+        {
+            Building->Visibility.Add(Name, Ev.data_length > 0 && Ev.data[0] != 0);
+        }
+    }
+
+    void FinishBatch()
+    {
+        if (!DomainPV.IsValid)
+            for (const FRawItem& R : RawKeyData)
+            {
+                FBox B;
+                if (PVLinkKeyData::HeaderBounds(R.Meta.GetData(), R.Meta.Num(), B)) DomainPV += B;
+            }
+        const float Diag = DomainPV.IsValid ? float(DomainPV.GetSize().Size()) : 1.f;
+        for (const FRawItem& R : RawKeyData)
+        {
+            FDMMesh M;
+            FString Err;
+            const FString Name = R.Key.Mid(8);   // after "KeyData/"
+            if (PVLinkKeyData::Build(Name, R.Meta.GetData(), R.Meta.Num(), R.Data.GetData(), R.Data.Num(),
+                                     PointSize * Diag, LineWidth * Diag, M, Err))
+                Building->Meshes.Add(MoveTemp(M));
+            else if (!Err.IsEmpty())
+                // Not reported as dropped: a malformed item would only be resent.
+                Messages.Enqueue(FString::Printf(TEXT("%s: %s"), *R.Key, *Err));
+        }
+        RawKeyData.Reset();
+        for (const FString& K : LastManifest)
+            if (!Manifest.Contains(K)) Building->Removed.Add(K);
+        LastManifest = Manifest;
+        Batches.Enqueue(MoveTemp(Building));
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -119,319 +297,128 @@ void UMeshReceiverSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
 
-    UE_LOG(LogTemp, Warning, TEXT("MeshReceiverSubsystem: Initializing"));
-
-    BaseScalarMaterial = LoadObject<UMaterial>(nullptr,
-        TEXT("/ParaViewLink/M_ScalarField.M_ScalarField"));
-
+    BaseScalarMaterial = LoadObject<UMaterial>(nullptr, TEXT("/ParaViewLink/M_ScalarField.M_ScalarField"));
 #if WITH_EDITOR
-    // First time the plugin is loaded in a new project: auto-create the material
-    // asset and save it into the plugin's Content folder.  Subsequent loads just
-    // pick up the saved .uasset via the LoadObject call above.
+    // First time the plugin is loaded in a new project: create and save the material.
     if (!BaseScalarMaterial)
         BaseScalarMaterial = CreateScalarFieldMaterial();
 #endif
+    if (!BaseScalarMaterial)
+        UE_LOG(LogTemp, Warning, TEXT("MeshReceiver: M_ScalarField not found - colormap display unavailable."));
 
-    if (BaseScalarMaterial)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("MeshReceiverSubsystem: Loaded M_ScalarField"));
-    }
-    else
-    {
-        UE_LOG(LogTemp, Warning, TEXT("MeshReceiverSubsystem: M_ScalarField not found — colormap display unavailable."));
-    }
-
-    // Create the flip-sync event (auto-reset so each Wait() consumes one Trigger()).
-    FlipEvent = FPlatformProcess::GetSynchEventFromPool(/*bIsManualReset=*/false);
-
-    UE_LOG(LogTemp, Warning, TEXT("MeshReceiverSubsystem: Ready"));
+    UE_LOG(LogTemp, Log, TEXT("MeshReceiver: DataManager client %s"), *Utf8(dm_version()));
     bActive = true;
+
+    if (!LocalStorePath.IsEmpty())
+    {
+        FString Store = FPaths::IsRelative(LocalStorePath)
+            ? FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / LocalStorePath) : LocalStorePath;
+        char Err[512] = {};
+        dm_client* C = dm_open_store(TCHAR_TO_UTF8(*Store), TCHAR_TO_UTF8(*Project), PlaybackRate, Err, sizeof Err);
+        if (C)
+        {
+            UE_LOG(LogTemp, Log, TEXT("MeshReceiver: playing store %s"), *Store);
+            StartClient(C);
+        }
+        else
+            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: cannot open store %s: %s"), *Store, *Utf8(Err));
+    }
+    else if (!DataManagerHost.IsEmpty())
+        ConnectToDataManager(DataManagerHost, DataManagerPort);
+    else
+        StartDiscovery();
 }
 
 void UMeshReceiverSubsystem::Deinitialize()
 {
-    // Stop ticking immediately so no game-thread Tick() fires after this point.
     bActive = false;
-
-    // If the IO thread is blocked in HandleRawMessage waiting for the flip event,
-    // unblock it so the thread can exit cleanly when Super calls Stop() + WaitForCompletion().
-    if (FlipEvent)
-        FlipEvent->Trigger();
-
-    // Stop the network thread and wait for it to exit BEFORE touching any state.
-    // Super::Deinitialize() clears OnMessageReceived, calls Stop(), then
-    // WaitForCompletion() — so when it returns the receiver thread is fully gone
-    // and HandleRawMessage() can never be called again.
-    Super::Deinitialize();
-
-    // Return the event to the pool now that the IO thread is guaranteed gone.
-    if (FlipEvent)
-    {
-        FPlatformProcess::ReturnSynchEventToPool(FlipEvent);
-        FlipEvent = nullptr;
-    }
-
-    // Now it is safe to drain and clear. The thread is dead, the callback is
-    // null — nothing can enqueue new commands or hold references to our UObjects.
-    { TUniquePtr<FPendingCommand> Cmd; while (InstallQueue.Dequeue(Cmd)) {} }
-
+    bDiscovering = false;
+    if (Discovery.IsValid()) Discovery.Wait();
+    StopClient();
     LiveActors.Empty();
-    PendingMeshes.Empty();
-    PendingPVData.Empty();
     Colormaps.Empty();
     VarMaterials.Empty();
     ColormapRanges.Empty();
+    Visible.Empty();
+    Super::Deinitialize();
 }
 
-// ---------------------------------------------------------------------------
-// Network thread — dispatch incoming messages
-// ---------------------------------------------------------------------------
-
-void UMeshReceiverSubsystem::HandleRawMessage(int32 Cmd, TArray<uint8> Payload)
+void UMeshReceiverSubsystem::StartClient(dm_client* NewClient)
 {
-    auto PendCmd = MakeUnique<FPendingCommand>();
-
-    if (Cmd == MeshCmd::Mesh)
-    {
-        FParsedMeshData Data = ParseMeshPayload(Payload);
-        if (Data.Name.IsEmpty())
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_MESH"));
-            return;
-        }
-        PendCmd->Type     = EPendingCmdType::Mesh;
-        PendCmd->MeshData = MoveTemp(Data);
-    }
-    else if (Cmd == MeshCmd::Update)
-    {
-        PendCmd->Type = EPendingCmdType::Flip;
-        InstallQueue.Enqueue(MoveTemp(PendCmd));
-
-        // Block the IO thread here until Tick() completes the buffer swap and
-        // triggers FlipEvent.  SocketReceiverRunnable::Run() sends the ack to
-        // ParaView only after this function returns, so this ensures the ack is
-        // not sent until the flip is fully done.
-        if (FlipEvent)
-            FlipEvent->Wait();
-        return;
-    }
-    else if (Cmd == MeshCmd::Scalars)
-    {
-        FString MeshName, VarName;
-        TArray<float> Scalars;
-        if (!ParseScalarsPayload(Payload, MeshName, VarName, Scalars))
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_SCALARS"));
-            return;
-        }
-        PendCmd->Type         = EPendingCmdType::Scalars;
-        PendCmd->MeshName     = MoveTemp(MeshName);
-        PendCmd->VariableName = MoveTemp(VarName);
-        PendCmd->Scalars      = MoveTemp(Scalars);
-    }
-    else if (Cmd == MeshCmd::Variable)
-    {
-        FString MeshName, VarName;
-        if (!ParseVariablePayload(Payload, MeshName, VarName))
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_VARIABLE"));
-            return;
-        }
-        PendCmd->Type         = EPendingCmdType::Variable;
-        PendCmd->MeshName     = MoveTemp(MeshName);
-        PendCmd->VariableName = MoveTemp(VarName);
-    }
-    else if (Cmd == MeshCmd::Ping)
-    {
-        // Handled entirely on the network thread — no game-thread work needed.
-        // Payload is an optional UTF-8 message; empty payload is also fine.
-        FString Msg;
-        if (Payload.Num() > 0)
-        {
-            Payload.Add(0);
-            Msg = UTF8_TO_TCHAR(reinterpret_cast<const char*>(Payload.GetData()));
-        }
-        UE_LOG(LogTemp, Warning, TEXT("MeshReceiver: PING%s%s"),
-            Msg.IsEmpty() ? TEXT("") : TEXT(" — "), *Msg);
-        return;   // ack already sent by the socket layer; nothing to enqueue
-    }
-    else if (Cmd == MeshCmd::Colormap)
-    {
-        FString VarName;
-        float Min = 0.f, Max = 1.f;
-        TArray<FLinearColor> RGB;
-        if (!ParseColormapPayload(Payload, VarName, Min, Max, RGB))
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_COLORMAP"));
-            return;
-        }
-        PendCmd->Type         = EPendingCmdType::Colormap;
-        PendCmd->VariableName = MoveTemp(VarName);
-        PendCmd->ColormapMin  = Min;
-        PendCmd->ColormapMax  = Max;
-        PendCmd->ColormapRGB  = MoveTemp(RGB);
-    }
-    else if (Cmd == MeshCmd::PVMesh)
-    {
-        FParsedMeshData Mesh;
-        TArray<float>   Scalars;
-        float           ScalarMin = 0.f, ScalarMax = 1.f;
-        FString         ColorName;
-        int32           ScalarLocation = -1;
-
-        if (!ParsePVMeshPayload(Payload, Mesh, Scalars, ScalarMin, ScalarMax,
-                                ColorName, ScalarLocation))
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_PVMESH"));
-            return;
-        }
-        PendCmd->Type            = EPendingCmdType::PVMesh;
-        PendCmd->MeshData        = MoveTemp(Mesh);
-        PendCmd->Scalars         = MoveTemp(Scalars);
-        PendCmd->ColormapMin     = ScalarMin;
-        PendCmd->ColormapMax     = ScalarMax;
-        PendCmd->VariableName    = MoveTemp(ColorName);
-        PendCmd->ScalarLocation  = ScalarLocation;
-    }
-    else if (Cmd == MeshCmd::Bounds)
-    {
-        FBox Bounds(ForceInit);
-        if (!ParseBoundsPayload(Payload, Bounds))
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_BOUNDS"));
-            return;
-        }
-        PendCmd->Type      = EPendingCmdType::Bounds;
-        PendCmd->BoundsBox = Bounds;
-    }
-    else if (Cmd == MeshCmd::Visibility)
-    {
-        FString MeshName;
-        bool bVisible = true;
-        if (!ParseVisibilityPayload(Payload, MeshName, bVisible))
-        {
-            UE_LOG(LogTemp, Error, TEXT("MeshReceiver: Failed to parse CMD_VISIBILITY"));
-            return;
-        }
-        PendCmd->Type     = EPendingCmdType::Visibility;
-        PendCmd->MeshName = MoveTemp(MeshName);
-        PendCmd->bVisible = bVisible;
-    }
-    else
-    {
-        Super::HandleRawMessage(Cmd, MoveTemp(Payload));
-        return;
-    }
-
-    InstallQueue.Enqueue(MoveTemp(PendCmd));
+    StopClient();
+    Client = NewClient;
+    Poller = new FDMPollRunnable(Client, PointSize, LineWidth);
+    PollerThread = FRunnableThread::Create(Poller, TEXT("PVLink DataManager poll"));
 }
 
-// ---------------------------------------------------------------------------
-// Game thread tick — drain the install queue
-// ---------------------------------------------------------------------------
-
-void UMeshReceiverSubsystem::Tick(float DeltaTime)
+void UMeshReceiverSubsystem::StopClient()
 {
-    TUniquePtr<FPendingCommand> Cmd;
-    while (InstallQueue.Dequeue(Cmd))
+    if (PollerThread)
     {
-        switch (Cmd->Type)
+        PollerThread->Kill(true);   // calls Stop(), waits for Run() to return
+        delete PollerThread;
+        PollerThread = nullptr;
+    }
+    delete Poller;
+    Poller = nullptr;
+    if (Client)
+    {
+        dm_close(Client);
+        Client = nullptr;
+    }
+}
+
+void UMeshReceiverSubsystem::ConnectToDataManager(const FString& Host, int32 Port)
+{
+    UE_LOG(LogTemp, Log, TEXT("MeshReceiver: connecting to DataManager %s:%d, project '%s'"), *Host, Port, *Project);
+    const FString Peer = FString::Printf(TEXT("Unreal %s"), FPlatformProcess::ComputerName());
+    StartClient(dm_connect(TCHAR_TO_UTF8(*Host), uint16(Port), TCHAR_TO_UTF8(*Project),
+                           TCHAR_TO_UTF8(*Peer), "", bCompress ? DM_WANT_COMPRESSION : 0));
+}
+
+void UMeshReceiverSubsystem::StartDiscovery()
+{
+    bDiscovering = true;
+    UE_LOG(LogTemp, Log, TEXT("MeshReceiver: looking for a DataManager on UDP %d"), DiscoveryPort);
+    const int32 Port = DiscoveryPort;
+    TWeakObjectPtr<UMeshReceiverSubsystem> Self(this);
+    Discovery = Async(EAsyncExecution::Thread, [this, Self, Port]()
+    {
+        int32 LastCount = -1;
+        while (bDiscovering)
         {
-        case EPendingCmdType::Mesh:
-        {
-            FString Name = Cmd->MeshData.Name;
-            PendingMeshes.Add(Name, MoveTemp(Cmd->MeshData));
-            break;
-        }
-        case EPendingCmdType::Flip:
-        {
-            UWorld* World = GetGameInstance()->GetWorld();
-            if (World)
+            char Buf[16384] = {};
+            const int32 Count = dm_discover(uint16(Port), 2500, Buf, sizeof Buf);
+            if (!bDiscovering) return;
+            if (Count == 1)
             {
-                // Classic CMD_MESH path — geometry only, no scalars bundled.
-                for (auto& [Name, Data] : PendingMeshes)
-                    InstallOrUpdate(World, Name, Data);
-
-                // CMD_PVMESH path — geometry + scalars in one packet.
-                for (auto& [Name, PVCmd] : PendingPVData)
+                TArray<FString> F;
+                FString(UTF8_TO_TCHAR(Buf)).TrimEnd().ParseIntoArray(F, TEXT("\t"), false);
+                if (F.Num() >= 2)
                 {
-                    InstallOrUpdate(World, Name, PVCmd.MeshData);
-
-                    if (PVCmd.ScalarLocation >= 0 && !PVCmd.VariableName.IsEmpty()
-                        && PVCmd.Scalars.Num() > 0)
+                    const FString Host = F[0];
+                    const int32 DMPort = FCString::Atoi(*F[1]);
+                    bDiscovering = false;
+                    AsyncTask(ENamedThreads::GameThread, [Self, Host, DMPort]()
                     {
-                        ColormapRanges.Add(PVCmd.VariableName,
-                                           FVector2f(PVCmd.ColormapMin, PVCmd.ColormapMax));
-                        TArray<float> ScalarsCopy = PVCmd.Scalars;
-                        HandleScalarsCmd(Name, PVCmd.VariableName, ScalarsCopy);
-                        HandleVariableCmd(Name, PVCmd.VariableName);
-                    }
+                        if (Self.IsValid() && Self->bActive) Self->ConnectToDataManager(Host, DMPort);
+                    });
+                    return;
                 }
-
-                int32 Total = PendingMeshes.Num() + PendingPVData.Num();
-                UE_LOG(LogTemp, Verbose,
-                    TEXT("MeshReceiver: Flip installed %d mesh(es)"), Total);
             }
-            PendingMeshes.Empty();
-            PendingPVData.Empty();
-
-            // Unblock the IO thread so SocketReceiverRunnable can send the
-            // UPDATE ack to ParaView.
-            if (FlipEvent)
-                FlipEvent->Trigger();
-            break;
+            if (Count != LastCount && Count > 1)
+                UE_LOG(LogTemp, Warning, TEXT("MeshReceiver: %d DataManagers announcing; set DataManagerHost to choose one"), Count);
+            LastCount = Count;
         }
-        case EPendingCmdType::Scalars:
-            HandleScalarsCmd(Cmd->MeshName, Cmd->VariableName, Cmd->Scalars);
-            break;
-
-        case EPendingCmdType::Variable:
-            HandleVariableCmd(Cmd->MeshName, Cmd->VariableName);
-            break;
-
-        case EPendingCmdType::Colormap:
-            HandleColormapCmd(Cmd->VariableName, Cmd->ColormapMin, Cmd->ColormapMax,
-                              Cmd->ColormapRGB);
-            break;
-
-        case EPendingCmdType::PVMesh:
-        {
-            // Buffer — do not install yet.  The next Flip (CMD_UPDATE) will
-            // drain both PendingMeshes and PendingPVData together so all meshes
-            // from one ParaView pipeline execution become active atomically.
-            const FString& Name = Cmd->MeshData.Name;
-            PendingPVData.Add(Name, MoveTemp(*Cmd));
-            UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: PVMesh '%s' buffered"), *Name);
-            break;
-        }
-
-        case EPendingCmdType::Visibility:
-        {
-            AStreamedMeshActor** ActorPtr = LiveActors.Find(Cmd->MeshName);
-            if (ActorPtr && IsValid(*ActorPtr))
-            {
-                (*ActorPtr)->SetActorHiddenInGame(!Cmd->bVisible);
-                UE_LOG(LogTemp, Log, TEXT("MeshReceiver: '%s' %s"),
-                    *Cmd->MeshName, Cmd->bVisible ? TEXT("shown") : TEXT("hidden"));
-            }
-            break;
-        }
-
-        case EPendingCmdType::Bounds:
-        {
-            StoredPVBounds = Cmd->BoundsBox;
-            FVector Min = StoredPVBounds.Min;
-            FVector Max = StoredPVBounds.Max;
-            UE_LOG(LogTemp, Verbose,
-                TEXT("MeshReceiver: Domain bounds received  "
-                     "X[%.4g, %.4g]  Y[%.4g, %.4g]  Z[%.4g, %.4g]"),
-                Min.X, Max.X, Min.Y, Max.Y, Min.Z, Max.Z);
-            ComputeCoordTransform();
-            break;
-        }
-        }
-    }
+    });
 }
+
+bool UMeshReceiverSubsystem::IsConnected() const { return Poller && Poller->bConnected; }
+void UMeshReceiverSubsystem::Play()  { if (Client) dm_play(Client); }
+void UMeshReceiverSubsystem::Pause() { if (Client) dm_pause(Client); }
+void UMeshReceiverSubsystem::Seek(float Time) { if (Client) dm_seek(Client, Time); }
+void UMeshReceiverSubsystem::Step(int32 Delta) { if (Client) dm_step(Client, Delta); }
+void UMeshReceiverSubsystem::SetRate(float R) { if (Client) dm_set_rate(Client, R); }
 
 TStatId UMeshReceiverSubsystem::GetStatId() const
 {
@@ -439,98 +426,127 @@ TStatId UMeshReceiverSubsystem::GetStatId() const
 }
 
 // ---------------------------------------------------------------------------
-// Game-thread handlers
+// Game thread: apply at most one batch per tick, whole, then acknowledge it.
 // ---------------------------------------------------------------------------
 
-void UMeshReceiverSubsystem::InstallOrUpdate(UWorld* World,
-                                              const FString& Name,
-                                              const FParsedMeshData& Data)
+void UMeshReceiverSubsystem::Tick(float DeltaTime)
 {
-    AStreamedMeshActor** Existing = LiveActors.Find(Name);
-    if (Existing && IsValid(*Existing))
+    if (!bActive || !Poller) return;
+    FString Msg;
+    while (Poller->Messages.Dequeue(Msg))
+        UE_LOG(LogTemp, Log, TEXT("MeshReceiver: %s"), *Msg);
+
+    if (bPlayOnStart && !bStartedPlaying && Poller->bHaveState)
     {
-        (*Existing)->SetActorTransform(CoordTransform);
-        (*Existing)->UpdateMesh(Data.Vertices, Data.Triangles, Data.Normals);
-        UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: Updated '%s'"), *Name);
+        bStartedPlaying = true;
+        SetRate(PlaybackRate);
+        Play();
     }
-    else
+
+    TUniquePtr<FDMBatch> Batch;
+    if (Poller->Batches.Dequeue(Batch))
     {
-        AStreamedMeshActor* Actor = World->SpawnActor<AStreamedMeshActor>();
-        Actor->SetActorLabel(Name);
+        ApplyBatch(*Batch);
+        dm_ack(Client, Batch->Id, nullptr, 0);
+    }
+}
+
+void UMeshReceiverSubsystem::ApplyBatch(FDMBatch& B)
+{
+    UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+    if (!World) return;
+
+    // Removals.
+    for (const FString& Key : B.Removed)
+    {
+        int32 Slash;
+        if (!Key.FindChar(TEXT('/'), Slash)) continue;
+        const FString Type = Key.Left(Slash), Name = Key.Mid(Slash + 1);
+        if (Type == TEXT("KeyData"))
+        {
+            if (AStreamedMeshActor* A = LiveActors.FindRef(Name)) if (IsValid(A)) A->Destroy();
+            LiveActors.Remove(Name);
+        }
+        else if (Type == TEXT("Visibility")) Visible.Remove(Name);
+    }
+
+    // Domain, colormaps, visibility.
+    if (B.Bounds.IsSet())
+    {
+        StoredPVBounds = B.Bounds.GetValue();
+        ComputeCoordTransform();
+    }
+    for (FDMColormap& C : B.Colormaps)
+    {
+        UTexture2D* Tex = CreateOrUpdateColormapTexture(C.Variable, C.RGB);
+        Colormaps.Add(C.Variable, Tex);
+        ColormapRanges.Add(C.Variable, FVector2f(C.Min, C.Max));
+        UMaterialInstanceDynamic* MID = EnsureVarMaterial(C.Variable, Tex);
+        for (auto& [Name, Actor] : LiveActors)
+            if (IsValid(Actor) && Actor->GetActiveVariable() == C.Variable)
+                Actor->SetActiveVariable(C.Variable, MID, C.Min, C.Max);
+    }
+    for (auto& [Name, bVis] : B.Visibility) Visible.Add(Name, bVis);
+
+    // No domain bounds item: fit the data itself.
+    if (!StoredPVBounds.IsValid && B.Meshes.Num() > 0)
+    {
+        for (const FDMMesh& M : B.Meshes) StoredPVBounds += FBox(M.Vertices);
+        ComputeCoordTransform();
+    }
+
+    // Meshes. Every change of this batch lands in this tick, so it shows in one frame.
+    static const FString Solid = TEXT("__solid");
+    for (FDMMesh& M : B.Meshes)
+    {
+        AStreamedMeshActor* Actor = LiveActors.FindRef(M.Name);
+        if (!IsValid(Actor))
+        {
+            Actor = World->SpawnActor<AStreamedMeshActor>();
+#if WITH_EDITOR
+            Actor->SetActorLabel(M.Name);
+#endif
+            LiveActors.Add(M.Name, Actor);
+        }
         Actor->SetActorTransform(CoordTransform);
-        Actor->UpdateMesh(Data.Vertices, Data.Triangles, Data.Normals);
-        LiveActors.Add(Name, Actor);
-        UE_LOG(LogTemp, Log, TEXT("MeshReceiver: Spawned '%s'"), *Name);
+        Actor->UpdateMesh(M.Vertices, M.Triangles, M.Normals);
+        if (!M.ColorBy.IsEmpty())
+        {
+            const FVector2f* R = ColormapRanges.Find(M.ColorBy);
+            const FVector2f Range = R ? *R : M.DataRange;
+            Actor->StoreScalars(M.ColorBy, M.ColorValues);
+            Actor->SetActiveVariable(M.ColorBy, EnsureVarMaterial(M.ColorBy, Colormaps.FindRef(M.ColorBy)),
+                                     Range.X, Range.Y > Range.X ? Range.Y : Range.X + 1.f);
+        }
+        else
+        {
+            if (!Colormaps.Contains(Solid))
+                Colormaps.Add(Solid, CreateOrUpdateColormapTexture(Solid, { SolidColor, SolidColor }));
+            TArray<float> Zeros;
+            Zeros.SetNumZeroed(M.Vertices.Num());
+            Actor->StoreScalars(Solid, Zeros);
+            Actor->SetActiveVariable(Solid, EnsureVarMaterial(Solid, Colormaps.FindRef(Solid)), 0.f, 1.f);
+        }
     }
+    ApplyVisibility();
+    CurrentTime = B.Time;
+    UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: batch %llu t=%g: %d mesh(es), %d removed, %d shown"),
+           B.Id, B.Time, B.Meshes.Num(), B.Removed.Num(), LiveActors.Num());
 }
 
-void UMeshReceiverSubsystem::HandleScalarsCmd(const FString& MeshName,
-                                               const FString& VarName,
-                                               TArray<float>& Scalars)
+void UMeshReceiverSubsystem::ApplyVisibility()
 {
-    AStreamedMeshActor** ActorPtr = LiveActors.Find(MeshName);
-    if (!ActorPtr || !IsValid(*ActorPtr))
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("MeshReceiver: CMD_SCALARS - mesh '%s' not found, scalars will be lost"),
-            *MeshName);
-        return;
-    }
-    (*ActorPtr)->StoreScalars(VarName, Scalars);
-}
-
-void UMeshReceiverSubsystem::HandleVariableCmd(const FString& MeshName,
-                                                const FString& VarName)
-{
-    AStreamedMeshActor** ActorPtr = LiveActors.Find(MeshName);
-    if (!ActorPtr || !IsValid(*ActorPtr))
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("MeshReceiver: CMD_VARIABLE - mesh '%s' not found"), *MeshName);
-        return;
-    }
-
-    UMaterialInstanceDynamic* MID = VarMaterials.FindRef(VarName);
-
-    // If the colormap message hasn't arrived yet (or EnsureVarMaterial failed
-    // earlier), try to create the MID now with whatever texture we have.
-    if (!MID)
-    {
-        UTexture2D* Tex = Colormaps.FindRef(VarName);
-        MID = EnsureVarMaterial(VarName, Tex);
-    }
-
-    // Use the colormap range if one has been received; fall back to [0,1].
-    // When the colormap arrives later, HandleColormapCmd will re-upload with
-    // the correct range.
-    FVector2f Range = ColormapRanges.FindRef(VarName);
-    float Min = Range.X;
-    float Max = (Range.Y > Range.X) ? Range.Y : Range.X + 1.f;
-
-    (*ActorPtr)->SetActiveVariable(VarName, MID, Min, Max);
-}
-
-void UMeshReceiverSubsystem::HandleColormapCmd(const FString& VarName,
-                                                float Min, float Max,
-                                                TArray<FLinearColor>& RGB)
-{
-    UTexture2D* Tex = CreateOrUpdateColormapTexture(VarName, RGB);
-    Colormaps.Add(VarName, Tex);
-    ColormapRanges.Add(VarName, FVector2f(Min, Max));
-
-    UMaterialInstanceDynamic* MID = EnsureVarMaterial(VarName, Tex);
-
-    // Re-upload vertex colours for any live actor currently displaying this variable
-    // so its texture coordinates reflect the new range.
     for (auto& [Name, Actor] : LiveActors)
-    {
-        if (IsValid(Actor) && Actor->GetActiveVariable() == VarName)
-            Actor->SetActiveVariable(VarName, MID, Min, Max);
-    }
-
-    UE_LOG(LogTemp, Verbose, TEXT("MeshReceiver: Updated colormap '%s' [%.4g, %.4g] (%d samples)"),
-        *VarName, Min, Max, RGB.Num());
+        if (IsValid(Actor))
+        {
+            const bool* V = Visible.Find(Name);
+            Actor->SetActorHiddenInGame(V && !*V);
+        }
 }
+
+// ---------------------------------------------------------------------------
+// Materials and colormaps (game thread)
+// ---------------------------------------------------------------------------
 
 UMaterialInstanceDynamic* UMeshReceiverSubsystem::EnsureVarMaterial(
     const FString& VarName, UTexture2D* ColormapTex)
@@ -598,7 +614,7 @@ UTexture2D* UMeshReceiverSubsystem::CreateOrUpdateColormapTexture(
 }
 
 // ---------------------------------------------------------------------------
-// Coordinate transform  (game thread)
+// Coordinate transform (game thread). StoredPVBounds is in Unreal's frame.
 // ---------------------------------------------------------------------------
 
 void UMeshReceiverSubsystem::ComputeCoordTransform()
@@ -668,272 +684,4 @@ void UMeshReceiverSubsystem::ComputeCoordTransform()
              "Scale=(%.3g, %.3g, %.3g)  Translate=(%.1f, %.1f, %.1f)"),
         Scale.X, Scale.Y, Scale.Z,
         Translation.X, Translation.Y, Translation.Z);
-}
-
-// ---------------------------------------------------------------------------
-// Payload parsers  (network thread — no UObject access)
-// ---------------------------------------------------------------------------
-
-bool UMeshReceiverSubsystem::ReadString(const uint8*& Ptr, const uint8* End, FString& OutStr)
-{
-    if (Ptr + 4 > End) return false;
-    int32 Len = *reinterpret_cast<const int32*>(Ptr);
-    Ptr += 4;
-    if (Len < 0 || Ptr + Len > End) return false;
-    TArray<uint8> Bytes(Ptr, Len);
-    Bytes.Add(0);
-    OutStr = UTF8_TO_TCHAR(reinterpret_cast<const char*>(Bytes.GetData()));
-    Ptr += Len;
-    return true;
-}
-
-FParsedMeshData UMeshReceiverSubsystem::ParseMeshPayload(const TArray<uint8>& Payload)
-{
-    FParsedMeshData Data;
-    const uint8* Ptr = Payload.GetData();
-    const uint8* End = Ptr + Payload.Num();
-
-    auto ReadInt32 = [&](int32& Out) -> bool {
-        if (Ptr + 4 > End) return false;
-        Out = *reinterpret_cast<const int32*>(Ptr);
-        Ptr += 4;
-        return true;
-    };
-
-    if (!ReadString(Ptr, End, Data.Name)) return Data;
-
-    int32 VertexCount = 0;
-    if (!ReadInt32(VertexCount) || VertexCount < 0 || Ptr + VertexCount * 12 > End)
-        return FParsedMeshData{};
-
-    Data.Vertices.SetNumUninitialized(VertexCount);
-    for (int32 i = 0; i < VertexCount; i++)
-    {
-        float X = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        float Y = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        float Z = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        Data.Vertices[i] = FVector(X, Y, Z);
-    }
-
-    int32 IndexCount = 0;
-    if (!ReadInt32(IndexCount) || IndexCount < 0 || Ptr + IndexCount * 4 > End)
-        return FParsedMeshData{};
-
-    Data.Triangles.SetNumUninitialized(IndexCount);
-    FMemory::Memcpy(Data.Triangles.GetData(), Ptr, IndexCount * 4);
-    Ptr += IndexCount * 4;
-
-    // Normals — count of 0 means let UE auto-compute (backward-compatible)
-    int32 NormalCount = 0;
-    if (ReadInt32(NormalCount) && NormalCount > 0 && Ptr + NormalCount * 12 <= End)
-    {
-        Data.Normals.SetNumUninitialized(NormalCount);
-        for (int32 i = 0; i < NormalCount; i++)
-        {
-            float X = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-            float Y = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-            float Z = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-            Data.Normals[i] = FVector(X, Y, Z);
-        }
-    }
-
-    return Data;
-}
-
-bool UMeshReceiverSubsystem::ParseScalarsPayload(const TArray<uint8>& Payload,
-                                                   FString& OutMeshName,
-                                                   FString& OutVarName,
-                                                   TArray<float>& OutScalars)
-{
-    const uint8* Ptr = Payload.GetData();
-    const uint8* End = Ptr + Payload.Num();
-
-    if (!ReadString(Ptr, End, OutMeshName)) return false;
-    if (!ReadString(Ptr, End, OutVarName))  return false;
-
-    if (Ptr + 4 > End) return false;
-    int32 Count = *reinterpret_cast<const int32*>(Ptr); Ptr += 4;
-    if (Count < 0 || Ptr + Count * 4 > End) return false;
-
-    OutScalars.SetNumUninitialized(Count);
-    FMemory::Memcpy(OutScalars.GetData(), Ptr, Count * 4);
-    return true;
-}
-
-bool UMeshReceiverSubsystem::ParseVariablePayload(const TArray<uint8>& Payload,
-                                                    FString& OutMeshName,
-                                                    FString& OutVarName)
-{
-    const uint8* Ptr = Payload.GetData();
-    const uint8* End = Ptr + Payload.Num();
-    return ReadString(Ptr, End, OutMeshName) && ReadString(Ptr, End, OutVarName);
-}
-
-bool UMeshReceiverSubsystem::ParsePVMeshPayload(const TArray<uint8>& Payload,
-                                                 FParsedMeshData& OutMesh,
-                                                 TArray<float>&   OutScalars,
-                                                 float&           OutScalarMin,
-                                                 float&           OutScalarMax,
-                                                 FString&         OutColorName,
-                                                 int32&           OutScalarLocation)
-{
-    // Wire layout (all little-endian, produced by UE5MeshSender.py — protocol v1.1):
-    //   int32   num_points
-    //   int32   num_triangles
-    //   int32   scalar_location   (-1=none, 0=per-point, 1=per-cell)
-    //   int32   has_normals       (0=none, 1=per-point normals follow positions)
-    //   int32   color_name_len
-    //   int32   mesh_name_len
-    //   float32[num_points * 3]   positions
-    //   float32[num_points * 3]   normals   (only present if has_normals == 1)
-    //   int32[num_triangles * 3]  triangle indices
-    //   float32[num_scalars]      scalar values  (present iff scalar_location >= 0)
-    //   float32[2]                [scalar_min, scalar_max]
-    //   utf8[color_name_len]      color-array name
-    //   utf8[mesh_name_len]       mesh/actor name
-
-    const uint8* Ptr = Payload.GetData();
-    const uint8* End = Ptr + Payload.Num();
-
-    auto ReadInt32 = [&](int32& Out) -> bool {
-        if (Ptr + 4 > End) return false;
-        Out = *reinterpret_cast<const int32*>(Ptr);
-        Ptr += 4;
-        return true;
-    };
-    auto ReadFloat = [&](float& Out) -> bool {
-        if (Ptr + 4 > End) return false;
-        Out = *reinterpret_cast<const float*>(Ptr);
-        Ptr += 4;
-        return true;
-    };
-    auto ReadUtf8 = [&](FString& Out, int32 Len) -> bool {
-        if (Len < 0 || Ptr + Len > End) return false;
-        TArray<uint8> Bytes(Ptr, Len);
-        Bytes.Add(0);
-        Out = UTF8_TO_TCHAR(reinterpret_cast<const char*>(Bytes.GetData()));
-        Ptr += Len;
-        return true;
-    };
-
-    // --- header ---
-    int32 NumPoints, NumTris, ScalarLoc, HasNormals, ColorNameLen, MeshNameLen;
-    if (!ReadInt32(NumPoints)     || NumPoints  < 0) return false;
-    if (!ReadInt32(NumTris)       || NumTris    < 0) return false;
-    if (!ReadInt32(ScalarLoc))                       return false;
-    if (!ReadInt32(HasNormals))                      return false;
-    if (!ReadInt32(ColorNameLen)  || ColorNameLen < 0) return false;
-    if (!ReadInt32(MeshNameLen)   || MeshNameLen  < 0) return false;
-
-    // --- positions ---
-    if (Ptr + NumPoints * 12 > End) return false;
-    OutMesh.Vertices.SetNumUninitialized(NumPoints);
-    for (int32 i = 0; i < NumPoints; ++i)
-    {
-        float X = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        float Y = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        float Z = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        OutMesh.Vertices[i] = FVector(X, Y, Z);
-    }
-
-    // --- normals (optional, per-point) ---
-    if (HasNormals == 1)
-    {
-        if (Ptr + NumPoints * 12 > End) return false;
-        OutMesh.Normals.SetNumUninitialized(NumPoints);
-        for (int32 i = 0; i < NumPoints; ++i)
-        {
-            float X = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-            float Y = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-            float Z = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-            OutMesh.Normals[i] = FVector(X, Y, Z);
-        }
-    }
-
-    // --- triangle indices ---
-    if (Ptr + NumTris * 12 > End) return false;   // 3 int32s per triangle
-    OutMesh.Triangles.SetNumUninitialized(NumTris * 3);
-    FMemory::Memcpy(OutMesh.Triangles.GetData(), Ptr, NumTris * 12);
-    Ptr += NumTris * 12;
-
-    // --- scalars (optional) ---
-    OutScalarLocation = ScalarLoc;
-    if (ScalarLoc >= 0)
-    {
-        int32 NumScalars = (ScalarLoc == 0) ? NumPoints : NumTris;
-        if (Ptr + NumScalars * 4 + 8 > End) return false;
-        OutScalars.SetNumUninitialized(NumScalars);
-        FMemory::Memcpy(OutScalars.GetData(), Ptr, NumScalars * 4);
-        Ptr += NumScalars * 4;
-        if (!ReadFloat(OutScalarMin) || !ReadFloat(OutScalarMax)) return false;
-    }
-    else
-    {
-        OutScalars.Empty();
-        OutScalarMin = 0.f;
-        OutScalarMax = 1.f;
-    }
-
-    // --- names ---
-    if (!ReadUtf8(OutColorName,    ColorNameLen)) return false;
-    if (!ReadUtf8(OutMesh.Name,    MeshNameLen))  return false;
-    if (OutMesh.Name.IsEmpty()) OutMesh.Name = TEXT("ParaViewMesh");
-
-    return true;
-}
-
-bool UMeshReceiverSubsystem::ParseVisibilityPayload(const TArray<uint8>& Payload,
-                                                     FString& OutMeshName,
-                                                     bool& bOutVisible)
-{
-    // Payload: int32 name_len, utf8[name_len] mesh_name, int32 visible
-    const uint8* Ptr = Payload.GetData();
-    const uint8* End = Ptr + Payload.Num();
-    if (!ReadString(Ptr, End, OutMeshName)) return false;
-    if (Ptr + 4 > End) return false;
-    bOutVisible = (*reinterpret_cast<const int32*>(Ptr) != 0);
-    return true;
-}
-
-bool UMeshReceiverSubsystem::ParseBoundsPayload(const TArray<uint8>& Payload,
-                                                 FBox& OutBounds)
-{
-    // Payload: float32[6]  { xmin, xmax, ymin, ymax, zmin, zmax }
-    if (Payload.Num() < 24) return false;
-    const float* F = reinterpret_cast<const float*>(Payload.GetData());
-    OutBounds = FBox(
-        FVector(F[0], F[2], F[4]),   // Min: xmin, ymin, zmin
-        FVector(F[1], F[3], F[5])    // Max: xmax, ymax, zmax
-    );
-    return true;
-}
-
-bool UMeshReceiverSubsystem::ParseColormapPayload(const TArray<uint8>& Payload,
-                                                    FString& OutVarName,
-                                                    float& OutMin, float& OutMax,
-                                                    TArray<FLinearColor>& OutRGB)
-{
-    const uint8* Ptr = Payload.GetData();
-    const uint8* End = Ptr + Payload.Num();
-
-    if (!ReadString(Ptr, End, OutVarName)) return false;
-
-    // min and max data values that bracket the colormap ends
-    if (Ptr + 8 > End) return false;
-    OutMin = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-    OutMax = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-
-    if (Ptr + 4 > End) return false;
-    int32 Count = *reinterpret_cast<const int32*>(Ptr); Ptr += 4;
-    if (Count < 0 || Ptr + Count * 12 > End) return false;   // 3 floats per sample
-
-    OutRGB.SetNumUninitialized(Count);
-    for (int32 i = 0; i < Count; i++)
-    {
-        float R = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        float G = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        float B = *reinterpret_cast<const float*>(Ptr); Ptr += 4;
-        OutRGB[i] = FLinearColor(R, G, B, 1.f);
-    }
-    return true;
 }

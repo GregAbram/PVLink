@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Packages the DataManager client library into the APK. -->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+  <resourceCopies>
+    <copyFile src="$S(PluginDir)/../ThirdParty/DataManager/lib/Android/arm64-v8a/libdmcore.so"
+              dst="$S(BuildDir)/libs/arm64-v8a/libdmcore.so" />
+  </resourceCopies>
+  <soLoadLibrary>
+    <loadLibrary name="dmcore" failmsg="ParaViewLink: libdmcore.so not loaded" />
+  </soLoadLibrary>
+</root>

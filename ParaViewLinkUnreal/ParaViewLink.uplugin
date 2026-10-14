@@ -3,7 +3,7 @@
     "Version": 1,
     "VersionName": "1.0",
     "FriendlyName": "ParaView Link",
-    "Description": "Streams mesh geometry and scalar field data from ParaView into Unreal Engine 5 over TCP. Provides a GameInstanceSubsystem, a procedural mesh actor, and a sim-container placement actor for mapping computational coordinates to UE world space.",
+    "Description": "Shows DataManager projects (ParaView data streamed or stored by the DataManager) in Unreal Engine 5: a GameInstanceSubsystem that receives batches, a procedural mesh actor, and a sim-container placement actor for mapping computational coordinates to UE world space.",
     "Category": "Visualization",
     "CreatedBy": "",
     "CreatedByURL": "",
