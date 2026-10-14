@@ -101,7 +101,7 @@ void AStreamedMeshActor::StoreScalars(const FString& VarName,
 {
     ScalarArrays.Add(VarName, Scalars);
     UE_LOG(LogTemp, Verbose, TEXT("StreamedMeshActor '%s': stored %d scalars for '%s'"),
-        *GetActorLabel(), Scalars.Num(), *VarName);
+        *GetName(), Scalars.Num(), *VarName);
 }
 
 void AStreamedMeshActor::SetActiveVariable(const FString& VarName,
@@ -113,7 +113,7 @@ void AStreamedMeshActor::SetActiveVariable(const FString& VarName,
     {
         UE_LOG(LogTemp, Warning,
             TEXT("StreamedMeshActor '%s': no scalars stored for variable '%s'"),
-            *GetActorLabel(), *VarName);
+            *GetName(), *VarName);
         return;
     }
 
@@ -129,7 +129,7 @@ void AStreamedMeshActor::SetActiveVariable(const FString& VarName,
 
     UE_LOG(LogTemp, Verbose,
         TEXT("StreamedMeshActor '%s': active variable '%s' [%.4g, %.4g]"),
-        *GetActorLabel(), *VarName, ScalarMin, ScalarMax);
+        *GetName(), *VarName, ScalarMin, ScalarMax);
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ void AStreamedMeshActor::UploadScalarsAsVertexColors(const TArray<float>& Scalar
     {
         UE_LOG(LogTemp, Warning,
             TEXT("StreamedMeshActor '%s': scalar count (%d) != vertex count (%d) - skipping"),
-            *GetActorLabel(), Scalars.Num(), NumOriginalVertices);
+            *GetName(), Scalars.Num(), NumOriginalVertices);
         return;
     }
 

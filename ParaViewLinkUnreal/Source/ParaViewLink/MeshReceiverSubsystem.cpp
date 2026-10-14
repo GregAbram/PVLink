@@ -12,6 +12,8 @@
 #include "StreamedMeshActor.h"
 #include "Components/BoxComponent.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "TextureResource.h"
 #include "Engine/Texture2D.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/Material.h"
